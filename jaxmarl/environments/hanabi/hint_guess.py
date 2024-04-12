@@ -81,17 +81,21 @@ class HintGuessGame(MultiAgentEnv):
             ),
         )
 
-        # every agent sees the hands in different order
-        _rngs = jax.random.split(rng_hands, self.num_agents)
-        permuted_hands = jax.vmap(
-            lambda rng: jax.random.permutation(rng, player_hands, axis=1)
-        )(_rngs)
+        # Duplicate the hands (one set for each agent):
+        player_hands = jnp.tile(player_hands, (2, 1, 1))
+        # Only shuffle one hand in one agent's state. This makes the index
+        # correspondence between the two hands different in each agent's state, which
+        # should make index-based policies impossible:
+        rng_hands, rng = jax.random.split(rng_hands)
+        player_hands = player_hands.at[0, 0, :].set(
+            jax.random.permutation(rng, player_hands[0, 0, :])
+        )
 
-        # choose one card of the second agent
-        target = jax.random.choice(rng_target, player_hands[1])
+        # The target is a random card from the second agent's hand:
+        target = jax.random.choice(rng_target, player_hands[1, 1, :])
 
         state = State(
-            player_hands=permuted_hands, target=target, hint=-1, guess=-1, turn=0
+            player_hands=player_hands, target=target, hint=-1, guess=-1, turn=0
         )
         return jax.lax.stop_gradient(self.get_obs(state)), state
 
