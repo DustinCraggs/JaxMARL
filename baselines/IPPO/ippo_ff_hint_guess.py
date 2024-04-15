@@ -21,13 +21,9 @@ from omegaconf import OmegaConf
 
 from .ippo_transf_hanabi import EncoderBlock
 
-# TODO: 
+# TODO:
 # - Allow flexible hidden size specification for FF model
-# - Try value token
-#   - Could replace no-op token because prob. of no-op will always be 1 or 0, but will
-#     but will just leave it because this will not be the case for every environment
-# - Use an extra token to represent role and step instead of appending this info to
-#   every token
+
 
 def get_activation(activation_name):
     if activation_name == "relu":
@@ -97,13 +93,14 @@ class TransformerActorCritic(nn.Module):
         )(obs)
         obs_embeddings = activation(obs_embeddings)
 
-        # Prepend a learnable no-op token:
-        no_op_embedding = nn.Embed(num_embeddings=1, features=self.embed_dim)(
-            jnp.zeros((1,), dtype=int)
+        # Prepend a learnable 'value' and 'no-op' token. These will be used to decode
+        # the logits for the no-op action and the critic value:
+        extra_embeddings = nn.Embed(num_embeddings=2, features=self.embed_dim)(
+            jnp.array((0, 1), dtype=int)
         )
-        # Repeat the no-op token to match the batch size:
-        no_op_embedding = jnp.tile(no_op_embedding, (*obs_embeddings.shape[:2], 1, 1))
-        obs_embeddings = jnp.concatenate([no_op_embedding, obs_embeddings], axis=-2)
+        # Repeat the extra tokens to match the batch size:
+        extra_embeddings = jnp.tile(extra_embeddings, (*obs_embeddings.shape[:2], 1, 1))
+        obs_embeddings = jnp.concatenate([extra_embeddings, obs_embeddings], axis=-2)
 
         for _ in range(self.transf_layers):
             obs_embeddings = EncoderBlock(
@@ -111,8 +108,8 @@ class TransformerActorCritic(nn.Module):
             )(obs_embeddings)
 
         # Requires own_hand_first=True in the environment, so that the first 5
-        # embeddings (excluding no-op) correspond to the "actionable" cards:
-        action_embeddings = obs_embeddings[..., : self.hand_size + 1, :]
+        # embeddings (excluding no-op and value) correspond to the "actionable" cards:
+        action_embeddings = obs_embeddings[..., 1 : self.hand_size + 2, :]
 
         actor_mean = nn.Dense(1)(action_embeddings)
         actor_mean = jnp.squeeze(actor_mean, axis=-1)
@@ -120,9 +117,8 @@ class TransformerActorCritic(nn.Module):
         action_logits = actor_mean - (unavail_actions * 1e10)
         pi = distrax.Categorical(logits=action_logits)
 
-        # TODO: Arbitrarily using the first card here, could create a dedicated "value"
-        # token (like no-op) instead:
-        value_embedding = action_embeddings[..., 1, :]
+        # Decode value from the first token (the "value" token):
+        value_embedding = action_embeddings[..., 0, :]
         critic = nn.Dense(512)(value_embedding)
         critic = activation(critic)
         critic = nn.Dense(1)(critic)
