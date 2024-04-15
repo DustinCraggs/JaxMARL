@@ -19,6 +19,24 @@ import matplotlib.pyplot as plt
 import hydra
 from omegaconf import OmegaConf
 
+from .ippo_transf_hanabi import EncoderBlock
+
+# TODO: 
+# - Allow flexible hidden size specification for FF model
+# - Try value token
+#   - Could replace no-op token because prob. of no-op will always be 1 or 0, but will
+#     but will just leave it because this will not be the case for every environment
+# - Use an extra token to represent role and step instead of appending this info to
+#   every token
+
+def get_activation(activation_name):
+    if activation_name == "relu":
+        return nn.relu
+    elif activation_name == "tanh":
+        return nn.tanh
+    else:
+        raise ValueError(f"Unknown activation: {activation_name}")
+
 
 class ActorCritic(nn.Module):
     action_dim: Sequence[int]
@@ -27,11 +45,7 @@ class ActorCritic(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-
-        if self.activation == "relu":
-            activation = nn.relu
-        else:
-            activation = nn.tanh
+        activation = get_activation(self.activation)
 
         obs, dones, avail_actions = x
         embedding = nn.Dense(
@@ -63,6 +77,58 @@ class ActorCritic(nn.Module):
         return pi, jnp.squeeze(critic, axis=-1)
 
 
+class TransformerActorCritic(nn.Module):
+    action_dim: Sequence[int]
+    activation: str = "tanh"
+    hidden_size: int = 64
+    transf_layers: int = 2
+    embed_dim: int = 32
+    hand_size: int = 5
+    ff_dim: int = 64
+
+    @nn.compact
+    def __call__(self, x):
+        activation = get_activation(self.activation)
+
+        obs, dones, avail_actions = x
+
+        obs_embeddings = nn.Dense(
+            self.embed_dim, kernel_init=orthogonal(np.sqrt(2)), use_bias=False
+        )(obs)
+        obs_embeddings = activation(obs_embeddings)
+
+        # Prepend a learnable no-op token:
+        no_op_embedding = nn.Embed(num_embeddings=1, features=self.embed_dim)(
+            jnp.zeros((1,), dtype=int)
+        )
+        # Repeat the no-op token to match the batch size:
+        no_op_embedding = jnp.tile(no_op_embedding, (*obs_embeddings.shape[:2], 1, 1))
+        obs_embeddings = jnp.concatenate([no_op_embedding, obs_embeddings], axis=-2)
+
+        for _ in range(self.transf_layers):
+            obs_embeddings = EncoderBlock(
+                hidden_dim=self.embed_dim, dim_feedforward=self.ff_dim
+            )(obs_embeddings)
+
+        # Requires own_hand_first=True in the environment, so that the first 5
+        # embeddings (excluding no-op) correspond to the "actionable" cards:
+        action_embeddings = obs_embeddings[..., : self.hand_size + 1, :]
+
+        actor_mean = nn.Dense(1)(action_embeddings)
+        actor_mean = jnp.squeeze(actor_mean, axis=-1)
+        unavail_actions = 1 - avail_actions
+        action_logits = actor_mean - (unavail_actions * 1e10)
+        pi = distrax.Categorical(logits=action_logits)
+
+        # TODO: Arbitrarily using the first card here, could create a dedicated "value"
+        # token (like no-op) instead:
+        value_embedding = action_embeddings[..., 1, :]
+        critic = nn.Dense(512)(value_embedding)
+        critic = activation(critic)
+        critic = nn.Dense(1)(critic)
+        return pi, jnp.squeeze(critic, axis=-1)
+
+
 class Transition(NamedTuple):
     done: jnp.ndarray
     action: jnp.ndarray
@@ -77,6 +143,15 @@ class Transition(NamedTuple):
 def batchify(x: dict, agent_list, num_actors):
     x = jnp.stack([x[a] for a in agent_list])
     return x.reshape((num_actors, -1))
+
+
+def batchify_obs(x: dict, agent_list, num_actors, matrix_obs):
+    x = jnp.stack([x[a] for a in agent_list])
+    # Maintain the shape of the matrix obs if necessary:
+    if matrix_obs:
+        return x.reshape((num_actors, *x.shape[-2:]))
+    else:
+        return x.reshape((num_actors, -1))
 
 
 def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
@@ -105,18 +180,21 @@ def make_train(config):
         return config["LR"] * frac
 
     def similarity_policy_test(rng, network_params, mode="exact_match"):
+        if config["MODEL_NAME"] == "transformer":
+            make_network = TransformerActorCritic
+        else:
+            make_network = ActorCritic
 
-        network = ActorCritic(
+        network = make_network(
             action_dim=env.action_space(env.agents[0]).n,
-            activation=config["ACTIVATION"],
-            hidden_size=config["HIDDEN_SIZE"],
+            **config["MODEL_KWARGS"],
         )
 
         def test_act(rng, avail_actions, obs):
             avail_actions = jax.lax.stop_gradient(
                 batchify(avail_actions, env.agents, env.num_agents)
             )
-            obs_batch = batchify(obs, env.agents, env.num_agents)
+            obs_batch = batchify_obs(obs, env.agents, env.num_agents, env.matrix_obs)
             ac_in = (
                 obs_batch[np.newaxis, :],
                 None,
@@ -138,36 +216,49 @@ def make_train(config):
             )
 
             # hint step
-            hint_actions = test_act(rng_ah, env.get_legal_moves(hint_state), obs)
-            obs, guess_state, _, _, _ = basic_env.step(rng_sh, hint_state, hint_actions)
+            actions = test_act(rng_ah, basic_env.get_legal_moves(hint_state), obs)
+            obs, guess_state, _, _, _ = basic_env.step(rng_sh, hint_state, actions)
+
+            hint_actions = actions["hinter"]
 
             # guess step
-            guess_actions = test_act(
-                rng_ag, basic_env.get_legal_moves(guess_state), obs
-            )
+            actions = test_act(rng_ag, basic_env.get_legal_moves(guess_state), obs)
+            guess_actions = actions["guesser"]
 
+            if basic_env.card_idx_actions:
+                # Convert the the actions back to cards representations (0 is the
+                # no-op action, so subtract one):
+                hint_actions = hint_state.player_hands[0, 0, hint_actions - 1]
+                guess_actions = hint_state.player_hands[1, 1, guess_actions - 1]
+
+            # 1 if correct hint and guess, 0 otherwise:
             return (
-                (hint_actions["hinter"] == correct_hint)
-                & (guess_actions["guesser"] == guess_state.target)
-            ).astype(
-                jnp.float32
-            )  # 1 if correct hint and guess, 0 otherwise
+                (hint_actions == correct_hint) & (guess_actions == guess_state.target)
+            ).astype(jnp.float32)
 
         rngs = jax.random.split(rng, config["NUM_SIMILARITY_TESTS"])
         scores = jax.vmap(get_score)(rngs)
         return scores.mean()
 
     def train(rng):
+        if config["MODEL_NAME"] == "transformer":
+            make_network = TransformerActorCritic
+        else:
+            make_network = ActorCritic
 
         # INIT NETWORK
-        network = ActorCritic(
+        network = make_network(
             action_dim=env.action_space(env.agents[0]).n,
-            activation=config["ACTIVATION"],
-            hidden_size=config["HIDDEN_SIZE"],
+            **config["MODEL_KWARGS"],
         )
         rng, _rng = jax.random.split(rng)
+        obs_shape = (
+            env.observation_space(env.agents[0]).shape
+            if env.matrix_obs
+            else (env.observation_space(env.agents[0]).n,)
+        )
         init_x = (
-            jnp.zeros((1, config["NUM_ENVS"], env.observation_space(env.agents[0]).n)),
+            jnp.zeros((1, config["NUM_ENVS"], *obs_shape)),
             jnp.zeros((1, config["NUM_ENVS"])),
             jnp.zeros((1, config["NUM_ENVS"], env.action_space(env.agents[0]).n)),
         )
@@ -207,7 +298,9 @@ def make_train(config):
                 avail_actions = jax.lax.stop_gradient(
                     batchify(avail_actions, env.agents, config["NUM_ACTORS"])
                 )
-                obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
+                obs_batch = batchify_obs(
+                    last_obs, env.agents, config["NUM_ACTORS"], env.matrix_obs
+                )
                 ac_in = (
                     obs_batch[np.newaxis, :],
                     last_done[np.newaxis, :],
@@ -248,7 +341,9 @@ def make_train(config):
 
             # CALCULATE ADVANTAGE
             train_state, env_state, last_obs, last_done, rng = runner_state
-            last_obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
+            last_obs_batch = batchify_obs(
+                last_obs, env.agents, config["NUM_ACTORS"], env.matrix_obs
+            )
             avail_actions = jnp.ones(
                 (config["NUM_ACTORS"], env.action_space(env.agents[0]).n)
             )
@@ -375,10 +470,12 @@ def make_train(config):
             train_state = update_state[0]
             rng = update_state[-1]
 
+            returns = traj_batch.info["returned_episode_returns"][-1, :].mean()
+            env_step = update_steps * config["NUM_ENVS"] * config["NUM_STEPS"]
             metric = {
-                "returns": traj_batch.info["returned_episode_returns"][-1, :].mean(),
-                "env_step": update_steps * config["NUM_ENVS"] * config["NUM_STEPS"],
-                "update_steps": update_steps,
+                "training/returns": returns,
+                "training/env_step": env_step,
+                "training/update_steps": update_steps,
             }
 
             if config.get("SIMILARITY_TEST_DURING_TRAINING", False):
@@ -390,7 +487,7 @@ def make_train(config):
                     "mutual_exclusive_similarity",
                 ]:
                     rng, _rng = jax.random.split(rng)
-                    metric[f"{mode}_test"] = similarity_policy_test(
+                    metric[f"strategy/{mode}_test"] = similarity_policy_test(
                         _rng, train_state.params, mode
                     )
 
@@ -422,17 +519,19 @@ def make_train(config):
 def single_run(config):
 
     wandb.init(
+        group=config["WANDB_RUN_GROUP"],
+        name=config["WANDB_RUN_NAME"],
         entity=config["ENTITY"],
         project=config["PROJECT"],
         tags=["PPO", config["ENV_NAME"].upper(), f"jax_{jax.__version__}"],
-        name=f'ppo_{config["ENV_NAME"]}',
         config=config,
         mode=config["WANDB_MODE"],
     )
 
     rng = jax.random.PRNGKey(config["SEED"])
     rngs = jax.random.split(rng, config["NUM_SEEDS"])
-    train_vjit = jax.jit(jax.vmap(make_train(config)))
+    device = jax.devices()[config["GPU_IDX"]]
+    train_vjit = jax.jit(jax.vmap(make_train(config)), device=device)
     outs = jax.block_until_ready(train_vjit(rngs))
 
 
@@ -447,8 +546,6 @@ def tune(default_config):
         config = copy.deepcopy(default_config)
         for k, v in dict(wandb.config).items():
             config[k] = v
-
-        print("running experiment with params:", config)
 
         rng = jax.random.PRNGKey(config["SEED"])
         rngs = jax.random.split(rng, config["NUM_SEEDS"])
@@ -487,6 +584,7 @@ def tune(default_config):
 
 @hydra.main(version_base=None, config_path="config", config_name="ippo_ff_hint_guess")
 def main(config):
+    # jax.config.update("jax_disable_jit", True)
     config = OmegaConf.to_container(config)
     single_run(config)
     # tune(config)

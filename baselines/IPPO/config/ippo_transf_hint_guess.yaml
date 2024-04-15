@@ -1,4 +1,4 @@
-"MODEL_NAME": "ff"
+"MODEL_NAME": "transformer"
 "GPU_IDX": 0
 "LR": 0.0005
 "NUM_ENVS": 128
@@ -13,10 +13,16 @@
 "VF_COEF": 0.5
 "MAX_GRAD_NORM": 1.
 "ENV_NAME": "hint_guess"
-"ENV_KWARGS": {}
+"ENV_KWARGS": {
+  matrix_obs: True,
+  card_idx_actions: True,
+}
 "MODEL_KWARGS": {
-  "hidden_size": 256,
   "activation": "tanh",
+  "hidden_size": 64,
+  "transf_layers": 2,
+  "embed_dim": 32,
+  "ff_dim": 64,
 }
 "ANNEAL_LR": True
 "SEED": 0
