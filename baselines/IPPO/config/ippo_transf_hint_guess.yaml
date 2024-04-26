@@ -1,40 +1,41 @@
-"MODEL_NAME": "transformer"
-"GPU_IDX": 0
-"LR": 0.0005
-"NUM_ENVS": 128
-"NUM_STEPS": 8
-"TOTAL_TIMESTEPS": 4e6
-"UPDATE_EPOCHS": 2
-"NUM_MINIBATCHES": 16
-"GAMMA": 0.99
-"GAE_LAMBDA": 0.95
-"CLIP_EPS": 0.1
-"ENT_COEF": 0.001
-"VF_COEF": 0.5
-"MAX_GRAD_NORM": 1.
-"ENV_NAME": "hint_guess"
-"ENV_KWARGS": {
+MODEL_NAME: transformer
+GPU_IDX: 0
+LR: 0.0005
+NUM_ENVS: 128
+NUM_STEPS: 8
+TOTAL_TIMESTEPS: 4e6
+UPDATE_EPOCHS: 2
+NUM_MINIBATCHES: 16
+GAMMA: 0.99
+GAE_LAMBDA: 0.95
+CLIP_EPS: 0.1
+ENT_COEF: 0.001
+VF_COEF: 0.5
+MAX_GRAD_NORM: 1.
+ENV_NAME: hint_guess
+ENV_KWARGS: {
   matrix_obs: True,
   card_idx_actions: True,
 }
-"MODEL_KWARGS": {
-  "activation": "tanh",
-  "hidden_size": 64,
-  "transf_layers": 2,
-  "embed_dim": 32,
-  "ff_dim": 64,
+MODEL_KWARGS: {
+  activation: tanh,
+  hidden_size: 64,
+  transf_layers: 2,
+  embed_dim: 32,
+  ff_dim: 64,
+  dropout_prob: 0.0,
 }
-"ANNEAL_LR": True
-"SEED": 0
-"NUM_SEEDS": 8
+ANNEAL_LR: True
+SEED: 0
+NUM_SEEDS: 8
 
 # test
-"SIMILARITY_TEST_DURING_TRAINING": True # perform the similarity tests every update step
-"NUM_SIMILARITY_TESTS": 128 # per similarity mode
+SIMILARITY_TEST_DURING_TRAINING: True # perform the similarity tests every update step
+NUM_SIMILARITY_TESTS: 128 # per similarity mode
 
 # WandB Params
-"WANDB_MODE": "disabled"
-"ENTITY": "mttga"
-"PROJECT": "hint_guess"
-"WANDB_RUN_GROUP": null
-"WANDB_RUN_NAME": "ff_0"
+WANDB_MODE: disabled
+ENTITY: mttga
+PROJECT: hint_guess
+WANDB_RUN_GROUP: null
+WANDB_RUN_NAME: transf_0

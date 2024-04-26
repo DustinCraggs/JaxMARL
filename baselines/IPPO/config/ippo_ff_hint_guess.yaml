@@ -1,34 +1,34 @@
-"MODEL_NAME": "ff"
-"GPU_IDX": 0
-"LR": 0.0005
-"NUM_ENVS": 128
-"NUM_STEPS": 8
-"TOTAL_TIMESTEPS": 4e6
-"UPDATE_EPOCHS": 2
-"NUM_MINIBATCHES": 16
-"GAMMA": 0.99
-"GAE_LAMBDA": 0.95
-"CLIP_EPS": 0.1
-"ENT_COEF": 0.001
-"VF_COEF": 0.5
-"MAX_GRAD_NORM": 1.
-"ENV_NAME": "hint_guess"
-"ENV_KWARGS": {}
-"MODEL_KWARGS": {
-  "hidden_size": 256,
-  "activation": "tanh",
+MODEL_NAME: ff
+GPU_IDX: 0
+LR: 0.0005
+NUM_ENVS: 128
+NUM_STEPS: 8
+TOTAL_TIMESTEPS: 4e6
+UPDATE_EPOCHS: 2
+NUM_MINIBATCHES: 16
+GAMMA: 0.99
+GAE_LAMBDA: 0.95
+CLIP_EPS: 0.1
+ENT_COEF: 0.001
+VF_COEF: 0.5
+MAX_GRAD_NORM: 1.
+ENV_NAME: hint_guess
+ENV_KWARGS: {}
+MODEL_KWARGS: {
+  hidden_size: 256,
+  activation: tanh,
 }
-"ANNEAL_LR": True
-"SEED": 0
-"NUM_SEEDS": 8
+ANNEAL_LR: True
+SEED: 0
+NUM_SEEDS: 8
 
 # test
-"SIMILARITY_TEST_DURING_TRAINING": True # perform the similarity tests every update step
-"NUM_SIMILARITY_TESTS": 128 # per similarity mode
+SIMILARITY_TEST_DURING_TRAINING: True # perform the similarity tests every update step
+NUM_SIMILARITY_TESTS: 128 # per similarity mode
 
 # WandB Params
-"WANDB_MODE": "disabled"
-"ENTITY": "mttga"
-"PROJECT": "hint_guess"
-"WANDB_RUN_GROUP": null
-"WANDB_RUN_NAME": "ff_0"
+WANDB_MODE: disabled
+ENTITY: mttga
+PROJECT: hint_guess
+WANDB_RUN_GROUP: null
+WANDB_RUN_NAME: ff_0

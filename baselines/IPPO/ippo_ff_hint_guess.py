@@ -81,6 +81,7 @@ class TransformerActorCritic(nn.Module):
     embed_dim: int = 32
     hand_size: int = 5
     ff_dim: int = 64
+    dropout_prob: float = 0.1
 
     @nn.compact
     def __call__(self, x):
@@ -104,7 +105,9 @@ class TransformerActorCritic(nn.Module):
 
         for _ in range(self.transf_layers):
             obs_embeddings = EncoderBlock(
-                hidden_dim=self.embed_dim, dim_feedforward=self.ff_dim
+                hidden_dim=self.embed_dim,
+                dim_feedforward=self.ff_dim,
+                dropout_prob=self.dropout_prob,
             )(obs_embeddings)
 
         # Requires own_hand_first=True in the environment, so that the first 5
@@ -205,7 +208,6 @@ def make_train(config):
 
         def get_score(rng):
             # notice that here we use the basic env and its primordial functions
-
             rng_r, rng_ah, rng_sh, rng_ag = jax.random.split(rng, 4)
             obs, hint_state, correct_hint = basic_env.reset_for_eval(
                 rng_r, reset_mode=mode, replace=False
@@ -281,7 +283,7 @@ def make_train(config):
         obsv, env_state = jax.vmap(env.reset, in_axes=(0))(reset_rng)
 
         # TRAIN LOOP
-        def _update_step(update_runner_state, unused):
+        def _update_step(update_runner_state, metrics):
             # COLLECT TRAJECTORIES
             runner_state, update_steps = update_runner_state
 
@@ -468,7 +470,7 @@ def make_train(config):
 
             returns = traj_batch.info["returned_episode_returns"][-1, :].mean()
             env_step = update_steps * config["NUM_ENVS"] * config["NUM_STEPS"]
-            metric = {
+            new_metrics = {
                 "training/returns": returns,
                 "training/env_step": env_step,
                 "training/update_steps": update_steps,
@@ -483,17 +485,19 @@ def make_train(config):
                     "mutual_exclusive_similarity",
                 ]:
                     rng, _rng = jax.random.split(rng)
-                    metric[f"strategy/{mode}_test"] = similarity_policy_test(
+                    new_metrics[f"strategy/{mode}_test"] = similarity_policy_test(
                         _rng, train_state.params, mode
                     )
 
             def callback(metric):
                 wandb.log(metric)
 
-            jax.debug.callback(callback, metric)
+            jax.debug.callback(callback, new_metrics)
+            metrics.append(new_metrics)
+
             update_steps = update_steps + 1
             runner_state = (train_state, env_state, last_obs, last_done, rng)
-            return (runner_state, update_steps), None
+            return (runner_state, update_steps), metrics
 
         rng, _rng = jax.random.split(rng)
         runner_state = (
@@ -503,20 +507,26 @@ def make_train(config):
             jnp.zeros((config["NUM_ACTORS"]), dtype=bool),
             _rng,
         )
-        runner_state, _ = jax.lax.scan(
-            _update_step, (runner_state, 0), None, config["NUM_UPDATES"]
+        runner_state, metrics = jax.lax.scan(
+            _update_step, (runner_state, 0), [], config["NUM_UPDATES"]
         )
 
-        return {"runner_state": runner_state}
+        return {"runner_state": runner_state, "metrics": metrics}
 
     return train
 
 
-def single_run(config):
+def init_wandb_run(config, trial_idx=None):
+    group_name = config["WANDB_RUN_GROUP"]
+    run_name = config["WANDB_RUN_NAME"]
 
-    wandb.init(
-        group=config["WANDB_RUN_GROUP"],
-        name=config["WANDB_RUN_NAME"],
+    if trial_idx is not None:
+        group_name = f"{group_name}_individual"
+        run_name = f"{run_name}_{trial_idx}"
+
+    return wandb.init(
+        group=group_name,
+        name=run_name,
         entity=config["ENTITY"],
         project=config["PROJECT"],
         tags=["PPO", config["ENV_NAME"].upper(), f"jax_{jax.__version__}"],
@@ -524,11 +534,53 @@ def single_run(config):
         mode=config["WANDB_MODE"],
     )
 
-    rng = jax.random.PRNGKey(config["SEED"])
-    rngs = jax.random.split(rng, config["NUM_SEEDS"])
-    device = jax.devices()[config["GPU_IDX"]]
-    train_vjit = jax.jit(jax.vmap(make_train(config)), device=device)
-    outs = jax.block_until_ready(train_vjit(rngs))
+
+def single_run(config):
+    with init_wandb_run(config):
+        rng = jax.random.PRNGKey(config["SEED"])
+        rngs = jax.random.split(rng, config["NUM_SEEDS"])
+        device = jax.devices()[config["GPU_IDX"]]
+        train_vjit = jax.jit(jax.vmap(make_train(config)), device=device)
+        outs = jax.block_until_ready(train_vjit(rngs))
+        # Metrics is a list, but because it's vectorised, it contains a single dict
+        # mapping metric names to arrays of shape (num_trials, num_updates).
+        metrics = outs["metrics"][0]
+        # Log final metric values as histograms:
+        # TODO: Improve histogram logging:
+        metric_names = [
+            "exact_match",
+            "similarity_match",
+            "mutual_exclusive",
+            "mutual_exclusive_similarity",
+        ]
+        for name in metric_names:
+            plot_name = f"{name}_score"
+            data = [[d] for d in metrics[f"strategy/{name}_test"][:, -1].tolist()]
+            print(data)
+            table = wandb.Table(data=data, columns=[plot_name])
+            wandb.log(
+                {
+                    f"final_evaluation/{name}_test": wandb.plot.histogram(
+                        table,
+                        plot_name,
+                        title=plot_name,
+                    )
+                }
+            )
+
+    # Log metrics for each trial to separate wandb runs.
+    metrics = outs["metrics"][0]
+    print("Logging individual metrics...")
+    for trial_idx in range(config["NUM_SEEDS"]):
+        with init_wandb_run(config, trial_idx=trial_idx):
+            num_steps = max([data.shape[1] for data in metrics.values()])
+            for step in range(num_steps):
+                this_step_metrics = {
+                    name: data[trial_idx, step]
+                    for name, data in metrics.items()
+                    if data.shape[1] > step
+                }
+                wandb.log(this_step_metrics)
 
 
 def tune(default_config):
