@@ -15,12 +15,24 @@ import hydra
 import jaxmarl
 
 from flax.linen.initializers import constant, orthogonal
-from typing import List, Sequence, NamedTuple, Any, Dict
+from typing import List, Sequence, NamedTuple, Any, Dict, Tuple
 from flax.training.train_state import TrainState
 from omegaconf import OmegaConf
 
 from jaxmarl.wrappers.baselines import LogWrapper
 from jaxmarl.wrappers.hanabi_token_obs import HanabiTokenObsWrapper
+
+# TODO:
+# - Are the batchify and unbatchify functions jitted?
+
+
+def get_activation(activation_name):
+    if activation_name == "relu":
+        return nn.relu
+    elif activation_name == "tanh":
+        return nn.tanh
+    else:
+        raise ValueError(f"Unknown activation: {activation_name}")
 
 
 class EncoderBlock(nn.Module):
@@ -134,13 +146,103 @@ class ActorCritic(nn.Module):
         return pi, jnp.squeeze(critic, axis=-1)
 
 
+class SingleObsTransformerActorCritic(nn.Module):
+    action_dim: Sequence[int]
+    config: Dict
+    # TODO: Remove defaults:
+    num_players: int = 2
+    num_colors: int = 5
+    hand_size: int = 5
+    num_obs_sequences: int = 4
+
+    transf_layers: int = 2
+    activation: str = "tanh"
+    hidden_size: int = 64
+    embed_dim: int = 32
+    hand_size: int = 5
+    ff_dim: int = 64
+    dropout_prob: float = 0.0
+
+    @nn.compact
+    def __call__(self, x):
+        *obs, dones, avail_actions = x
+        activation = get_activation(self.activation)
+
+        # Different dense encoder for each sequence in obs:
+        obs_embeddings = [
+            nn.Dense(self.embed_dim)(obs[i]) for i in range(self.num_obs_sequences)
+        ]
+        obs_embeddings = jnp.concatenate(obs_embeddings, axis=-2)
+        print(f"{obs_embeddings.shape=}")
+        # obs_embeddings = activation(obs_embeddings)
+
+        # # Prepend a learnable 'value' and 'no-op' token. These will be used to decode
+        # # the logits for the no-op action and the critic value:
+        # extra_embeddings = nn.Embed(num_embeddings=2, features=self.embed_dim)(
+        #     jnp.array((0, 1), dtype=int)
+        # )
+        # # Repeat the extra tokens to match the batch size:
+        # extra_embeddings = jnp.tile(extra_embeddings, (*obs_embeddings.shape[:2], 1, 1))
+        # obs_embeddings = jnp.concatenate([extra_embeddings, obs_embeddings], axis=-2)
+
+        for _ in range(self.transf_layers):
+            obs_embeddings = EncoderBlock(
+                hidden_dim=self.embed_dim,
+                dim_feedforward=self.ff_dim,
+                dropout_prob=self.dropout_prob,
+            )(obs_embeddings)
+        print(f"{obs_embeddings.shape=}")
+
+        # Extract the actionable cards:
+        # Embeddings 5-9 are this player's hand, 10+ are partners' hands, last embedding
+        # is no-op
+        # TODO: This will be replaced with a mask computed elsewhere:
+        last_actionable_card_idx = (
+            self.num_colors + self.num_players * self.hand_size + 1
+        )
+        print(f"\t\tFrom {self.num_colors=}")
+        print(f"\t\tTo {last_actionable_card_idx=}")
+        # Player hands starts at num_colors + 1 (after fireworks and action tokens):
+        action_embeddings = jnp.concatenate(
+            (
+                obs_embeddings[..., self.num_colors + 1 : last_actionable_card_idx, :],
+                # obs_embeddings[..., -1:, :],
+            ),
+            axis=-2,
+        )
+
+        print(f"{action_embeddings.shape=}")
+        # Two actions per card:
+        actor_mean = nn.Dense(2)(action_embeddings)
+        print(f"{actor_mean.shape=}")
+
+        actor_mean = actor_mean.reshape(*actor_mean.shape[:-2], -1)
+        print(f"{actor_mean.shape=}")
+        # TODO: Use no-op token and remove extra element. Temporary: Append 0:
+        actor_mean = jnp.concatenate(
+            (actor_mean, jnp.zeros((*actor_mean.shape[:-1], 1))), axis=-1
+        )
+
+        unavail_actions = 1 - avail_actions
+        action_logits = actor_mean - (unavail_actions * 1e10)
+        pi = distrax.Categorical(logits=action_logits)
+
+        # Decode value from the first token (the "value" token):
+        value_embedding = action_embeddings[..., 0, :]
+        critic = nn.Dense(512)(value_embedding)
+        critic = activation(critic)
+        critic = nn.Dense(1)(critic)
+        return pi, jnp.squeeze(critic, axis=-1)
+
+
 class Transition(NamedTuple):
     done: jnp.ndarray
     action: jnp.ndarray
     value: jnp.ndarray
     reward: jnp.ndarray
     log_prob: jnp.ndarray
-    obs: jnp.ndarray
+    obs: Tuple[jnp.ndarray, ...]
+    # obs: jnp.ndarray
     info: jnp.ndarray
     avail_actions: jnp.ndarray
 
@@ -148,6 +250,13 @@ class Transition(NamedTuple):
 def batchify(x: dict, agent_list, num_actors):
     x = jnp.stack([x[a] for a in agent_list])
     return x.reshape((num_actors, -1))
+
+
+def batchify_obs(x: dict, agent_list, num_actors, num_sequences):
+    x = [jnp.vstack([x[a][seq] for a in agent_list]) for seq in range(num_sequences)]
+    return tuple(
+        x[seq].reshape((num_actors, *x[seq].shape[-2:])) for seq in range(num_sequences)
+    )
 
 
 def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
@@ -165,6 +274,7 @@ def make_train(config):
         config["NUM_ACTORS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
 
+    env = HanabiTokenObsWrapper(env)
     env = LogWrapper(env)
 
     def linear_schedule(count):
@@ -176,15 +286,23 @@ def make_train(config):
         return config["LR"] * frac
 
     def train(rng):
+        # INIT ENV
+        rng, _rng = jax.random.split(rng)
+        reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
+        obsv, env_state = jax.vmap(env.reset, in_axes=(0))(reset_rng)
 
         # INIT NETWORK
-        network = ActorCritic(env.action_space(env.agents[0]).n, config=config)
-
+        network = SingleObsTransformerActorCritic(
+            env.action_space(env.agents[0]).n,
+            config=config,
+        )
+        # network = ActorCritic(env.action_space(env.agents[0]).n, config=config)
         rng, _rng = jax.random.split(rng)
+        # Use env obs to initialize network:
         init_x = (
-            jnp.zeros((1, config["NUM_ENVS"], env.observation_space(env.agents[0]).n)),
-            jnp.zeros((1, config["NUM_ENVS"])),
-            jnp.zeros((1, config["NUM_ENVS"], env.action_space(env.agents[0]).n)),
+            *batchify_obs(obsv, env.agents, config["NUM_ACTORS"], 4),
+            jnp.zeros((1, config["NUM_ACTORS"])),
+            jnp.zeros((1, config["NUM_ACTORS"], env.action_space(env.agents[0]).n)),
         )
         network_params = network.init(_rng, init_x)
         if config["ANNEAL_LR"]:
@@ -203,11 +321,6 @@ def make_train(config):
             tx=tx,
         )
 
-        # INIT ENV
-        rng, _rng = jax.random.split(rng)
-        reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
-        obsv, env_state = jax.vmap(env.reset, in_axes=(0))(reset_rng)
-
         # TRAIN LOOP
         def _update_step(update_runner_state, unused):
             # COLLECT TRAJECTORIES
@@ -217,17 +330,22 @@ def make_train(config):
                 train_state, env_state, last_obs, last_done, rng = runner_state
 
                 # SELECT ACTION
-                rng, _rng = jax.random.split(rng)
                 avail_actions = jax.vmap(env.get_legal_moves)(env_state.env_state)
                 avail_actions = jax.lax.stop_gradient(
                     batchify(avail_actions, env.agents, config["NUM_ACTORS"])
                 )
-                obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
+
+                obs_batch = batchify_obs(last_obs, env.agents, config["NUM_ACTORS"], 4)
+
+                # obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
                 ac_in = (
-                    obs_batch[np.newaxis, :],
+                    *obs_batch,
+                    # obs_batch[np.newaxis, :],
                     last_done[np.newaxis, :],
                     avail_actions[np.newaxis, :],
                 )
+
+                rng, _rng = jax.random.split(rng)
                 pi, value = network.apply(train_state.params, ac_in)
                 action = pi.sample(seed=_rng)
                 log_prob = pi.log_prob(action)
@@ -263,12 +381,13 @@ def make_train(config):
 
             # CALCULATE ADVANTAGE
             train_state, env_state, last_obs, last_done, rng = runner_state
-            last_obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
+            last_obs_batch = batchify_obs(last_obs, env.agents, config["NUM_ACTORS"], 4)
             avail_actions = jnp.ones(
                 (config["NUM_ACTORS"], env.action_space(env.agents[0]).n)
             )
             ac_in = (
-                last_obs_batch[np.newaxis, :],
+                *last_obs_batch,
+                # last_obs_batch[np.newaxis, :],
                 last_done[np.newaxis, :],
                 avail_actions,
             )
@@ -308,9 +427,14 @@ def make_train(config):
 
                     def _loss_fn(params, traj_batch, gae, targets):
                         # RERUN NETWORK
+                        print(f"{traj_batch.obs=}")
                         pi, value = network.apply(
                             params,
-                            (traj_batch.obs, traj_batch.done, traj_batch.avail_actions),
+                            (
+                                *traj_batch.obs,
+                                traj_batch.done,
+                                traj_batch.avail_actions,
+                            ),
                         )
                         log_prob = pi.log_prob(traj_batch.action)
 
@@ -441,6 +565,7 @@ def main(config):
 
 
 if __name__ == "__main__":
+    # jax.config.update("jax_disable_jit", True)
     main()
     """results = out["metrics"]["returned_episode_returns"].mean(-1).reshape(-1)
     jnp.save('hanabi_results', results)
