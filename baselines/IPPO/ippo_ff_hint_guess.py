@@ -11,18 +11,24 @@ from flax.linen.initializers import constant, orthogonal
 from typing import Sequence, NamedTuple, Any, Dict
 from flax.training.train_state import TrainState
 import distrax
+from jaxmarl.environments.hanabi.hint_guess_metrics import compute_hinter_metrics
 from jaxmarl.wrappers.baselines import LogWrapper
 import jaxmarl
 import wandb
 import functools
 import matplotlib.pyplot as plt
 import hydra
+
+from functools import partial
 from omegaconf import OmegaConf
 
 from .ippo_transf_hanabi import EncoderBlock
 
 # TODO:
 # - Allow flexible hidden size specification for FF model
+# - Does calling vmap on the same function multiple times have overhead? Could move
+#   this outside of inner loops
+# - Fix: Histograms on wandb appear to be missing data
 
 
 def get_activation(activation_name):
@@ -156,6 +162,166 @@ def batchify_obs(x: dict, agent_list, num_actors, matrix_obs):
 def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
     x = x.reshape((num_actors, num_envs, -1))
     return {a: x[i] for i, a in enumerate(agent_list)}
+
+
+@jax.jit
+def get_network(config, env):
+    if config["MODEL_NAME"] == "transformer":
+        make_network = TransformerActorCritic
+    else:
+        make_network = ActorCritic
+    return make_network(
+        action_dim=env.action_space(env.agents[0]).n,
+        **config["MODEL_KWARGS"],
+    )
+
+
+@partial(jax.jit, static_argnums=[0, 1, 2, 3, 4])
+def get_test_rollouts(
+    env,
+    network,
+    num_actors,
+    num_envs,
+    num_rollouts,
+    rng,
+    train_state,
+):
+    # TODO:
+    # - Could we write this for one env and then just vectorise?
+    # - Change num_rollouts to num_steps
+    # - use partial at callsites instead of static args here
+    def step_envs(runner_state, transition):
+        train_state, env_state, last_obs, last_done, rng = runner_state
+        # Prepare AC inputs:
+        avail_actions = jax.vmap(env.get_legal_moves)(env_state.env_state)
+        avail_actions = batchify(avail_actions, env.agents, num_actors)
+        avail_actions = jax.lax.stop_gradient(avail_actions)
+        obs_batch = batchify_obs(last_obs, env.agents, num_actors, env.matrix_obs)
+        ac_in = (
+            obs_batch[jnp.newaxis, :],
+            last_done[jnp.newaxis, :],
+            avail_actions[jnp.newaxis, :],
+        )
+        # Sample actions:
+        pi, values = network.apply(train_state.params, ac_in)
+        rng, _rng = jax.random.split(rng)
+        action = pi.sample(seed=_rng)
+        log_prob = pi.log_prob(action)
+        env_act = unbatchify(action, env.agents, num_envs, env.num_agents)
+        env_act = jax.tree_map(lambda x: x.squeeze(), env_act)
+
+        # Step environments:
+        rng, _rng = jax.random.split(rng)
+        rng_step = jax.random.split(_rng, num_envs)
+        obsv, env_state, rewards, dones, infos = jax.vmap(env.step, in_axes=(0, 0, 0))(
+            rng_step, env_state, env_act
+        )
+        infos = jax.tree_map(lambda x: x.reshape(num_actors), infos)
+        done_batch = batchify(dones, env.agents, num_actors).squeeze()
+        rewards = batchify(rewards, env.agents, num_actors).squeeze()
+        transition = Transition(
+            done_batch,
+            action.squeeze(),
+            values.squeeze(),
+            rewards,
+            log_prob.squeeze(),
+            obs_batch,
+            infos,
+            avail_actions,
+        )
+        runner_state = (train_state, env_state, obsv, done_batch, rng)
+        return runner_state, (transition, env_state, env_act)
+
+    # Initialise new env states for testing:
+    rng, _rng = jax.random.split(rng)
+    reset_rngs = jax.random.split(_rng, num_envs)
+    obsv, env_states = jax.vmap(env.reset)(reset_rngs)
+
+    # Collect rollouts:
+    num_steps = num_rollouts // num_envs * 2
+    rng, _rng = jax.random.split(rng)
+    runner_state = (
+        train_state,
+        env_states,
+        obsv,
+        jnp.zeros(num_actors, dtype=bool),
+        _rng,
+    )
+    runner_state, traj_batch = jax.lax.scan(step_envs, runner_state, None, num_steps)
+    transitions, env_states, env_actions = traj_batch
+    return transitions, env_states, env_actions
+
+
+@partial(jax.jit, static_argnums=[0, 1, 2, 3, 4])
+def get_test_metrics(
+    env,
+    network,
+    num_actors,
+    num_envs,
+    num_rollouts,
+    rng,
+    train_state,
+):
+    transition, env_states, actions = get_test_rollouts(
+        env,
+        network,
+        num_actors,
+        num_envs,
+        num_rollouts,
+        rng,
+        train_state,
+    )
+    env_states = env_states.env_state
+
+    # Flatten across parallel envs:
+    hinter_actions = actions["hinter"].ravel()
+    target_cards = env_states.target.ravel()
+    player_hands = env_states.player_hands
+    player_hands = player_hands.reshape(-1, *player_hands.shape[2:])
+
+    metrics = jax.vmap(
+        jax.jit(
+            partial(
+                compute_hinter_metrics,
+                card_idx_to_features=env.card_feature_space,
+                card_idx_actions=env.card_idx_actions,
+            )
+        )
+    )(player_hands, target_cards, hinter_actions)
+
+    exact_match_rate = (
+        metrics["exact_match"].sum() / metrics["exact_match_possible"].sum()
+    )
+    unambiguous_sim_hint_rate = (
+        metrics["feature_sim_hint"] * metrics["unambiguous_sim_hint_possible"]
+    ).sum() / metrics["unambiguous_sim_hint_possible"].sum()
+    unambiguous_dissim_hint_rate = (
+        metrics["feature_dissim_hint"] * metrics["unambiguous_dissim_hint_possible"]
+    ).sum() / metrics["unambiguous_dissim_hint_possible"].sum()
+    unambiguous_sim_hint_rate = jnp.nan_to_num(unambiguous_sim_hint_rate)
+    unambiguous_dissim_hint_rate = jnp.nan_to_num(unambiguous_dissim_hint_rate)
+
+    sim_distance = (metrics["action_distance"] - metrics["min_guess_distance"]).mean()
+    dissim_distance = (
+        metrics["max_guess_distance"] - metrics["action_distance"]
+    ).mean()
+
+    strategy_metrics = {
+        "exact_match": exact_match_rate,
+        "feature_sim_hint_rate": metrics["feature_sim_hint"].mean(),
+        "unambiguous_feature_sim_hint_rate": unambiguous_sim_hint_rate,
+        "feature_dissim_hint_rate": metrics["feature_dissim_hint"].mean(),
+        "unambiguous_feature_dissim_hint_rate": unambiguous_dissim_hint_rate,
+        "sim_distance": sim_distance,
+        "dissim_distance": dissim_distance,
+    }
+    strategy_metrics = {f"test/strategy/{k}": v for k, v in strategy_metrics.items()}
+
+    return {
+        # rewards contains both agent's rewards, so divide by 2:
+        "test/mean_return": transition.reward.sum() / (num_rollouts * 2),
+        **strategy_metrics,
+    }
 
 
 def make_train(config):
@@ -489,6 +655,18 @@ def make_train(config):
                         _rng, train_state.params, mode
                     )
 
+            rng, _rng = jax.random.split(rng)
+            test_metrics = get_test_metrics(
+                env,
+                network,
+                config["NUM_ACTORS"],
+                config["NUM_ENVS"],
+                config["NUM_TEST_ROLLOUTS"],
+                _rng,
+                train_state,
+            )
+            new_metrics = {**new_metrics, **test_metrics}
+
             def callback(metric):
                 wandb.log(metric)
 
@@ -556,7 +734,6 @@ def single_run(config):
         for name in metric_names:
             plot_name = f"{name}_score"
             data = [[d] for d in metrics[f"strategy/{name}_test"][:, -1].tolist()]
-            print(data)
             table = wandb.Table(data=data, columns=[plot_name])
             wandb.log(
                 {

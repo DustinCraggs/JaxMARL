@@ -6,6 +6,7 @@ NUM_STEPS: 8
 TOTAL_TIMESTEPS: 4e6
 UPDATE_EPOCHS: 2
 NUM_MINIBATCHES: 16
+NUM_TEST_ROLLOUTS: 1028
 GAMMA: 0.99
 GAE_LAMBDA: 0.95
 CLIP_EPS: 0.1
@@ -13,14 +14,16 @@ ENT_COEF: 0.001
 VF_COEF: 0.5
 MAX_GRAD_NORM: 1.
 ENV_NAME: hint_guess
-ENV_KWARGS: {}
+ENV_KWARGS: {
+  # card_idx_actions: True,
+}
 MODEL_KWARGS: {
   hidden_size: 256,
   activation: tanh,
 }
 ANNEAL_LR: True
 SEED: 0
-NUM_SEEDS: 8
+NUM_SEEDS: 64
 
 # test
 SIMILARITY_TEST_DURING_TRAINING: True # perform the similarity tests every update step
