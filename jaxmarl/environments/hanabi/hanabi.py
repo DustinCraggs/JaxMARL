@@ -184,7 +184,7 @@ class HanabiEnv(HanabiGame):
         """Get all agents' observations."""
 
         # no agent-specific obs
-        board_fats = self.get_board_fats(new_state)
+        board_feats = self.get_board_feats(new_state)
         discard_feats = self._binarize_discard_pile(new_state.discard_pile)
 
         def _observe(aidx: int):
@@ -215,7 +215,7 @@ class HanabiEnv(HanabiGame):
             return jnp.concatenate(
                 (
                     hands_feats,
-                    board_fats,
+                    board_feats,
                     discard_feats,
                     last_action_feats,
                     belief_v0_feats,
@@ -306,6 +306,8 @@ class HanabiEnv(HanabiGame):
         """Get the features of the last action taken"""
 
         acting_player_index = old_state.cur_player_idx  # absolute OH index
+        # TODO: What if there are more than 2 agents, and the target of the hint is not
+        # the current player in new_state?
         target_player_index = new_state.cur_player_idx  # absolute OH index
         acting_player_relative_index = jnp.roll(
             acting_player_index, -aidx
@@ -445,7 +447,7 @@ class HanabiEnv(HanabiGame):
 
 
     @partial(jax.jit, static_argnums=[0])
-    def get_board_fats(self, state: State):
+    def get_board_feats(self, state: State):
         """Get the features of the board."""
         # by default the fireworks are incremental, i.e. [1,1,0,0,0] one and two are in the board
         # must be OH of only the highest rank, i.e. [0,1,0,0,0]

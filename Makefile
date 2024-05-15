@@ -26,3 +26,8 @@ run:
 test:
 	$(DOCKER_RUN) /bin/bash -c "pytest ./tests/"
 
+exec:
+	docker exec -it $(shell docker ps -aqf "ancestor=$(IMAGE)") /bin/bash
+
+attach:
+	docker attach $(shell docker ps -aqf "ancestor=$(IMAGE)")

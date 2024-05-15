@@ -2,14 +2,19 @@
 This class models the game dynamics of Hanabi (reset and step of the game).
 """
 
+import itertools
 import numpy as np
 import jax
 import jax.numpy as jnp
-from jax import lax
+import pprint
 import chex
+import dataclasses
+
+from jax import lax
 from flax import struct
 from typing import Tuple, Dict
 from functools import partial
+
 from jaxmarl.environments.multi_agent_env import MultiAgentEnv
 
 
@@ -63,7 +68,7 @@ class HanabiGame(MultiAgentEnv):
         self.color_map = color_map
 
     @partial(jax.jit, static_argnums=[0])
-    def get_first_state(self, key:chex.PRNGKey, deck:chex.Array) -> State:
+    def get_first_state(self, key: chex.PRNGKey, deck: chex.Array) -> State:
         """Get the initial state of the game"""
 
         def _deal_cards(aidx, unused):
@@ -158,7 +163,7 @@ class HanabiGame(MultiAgentEnv):
         return self.get_first_state(key, deck)
 
     @partial(jax.jit, static_argnums=[0])
-    def reset_game_from_deck(self, key: chex.PRNGKey, deck:chex.PRNGKey) -> State:
+    def reset_game_from_deck(self, key: chex.PRNGKey, deck: chex.PRNGKey) -> State:
         return self.get_first_state(key, deck)
 
     @partial(jax.jit, static_argnums=[0])
@@ -428,3 +433,40 @@ class HanabiGame(MultiAgentEnv):
             ),
             reward,
         )
+
+
+def print_random_rollout(print_shapes_only=False, step_through=True, **env_kwargs):
+    env = HanabiGame(**env_kwargs)
+
+    key = jax.random.PRNGKey(0)
+    state = env.reset_game(key)
+    print(f"Initial state: -------------------------------------------------------")
+    print_state(state, print_shapes_only)
+
+    agent_idxs = itertools.cycle(range(env.num_agents))
+    while not state.terminal:
+        if step_through:
+            input("Press enter to step...")
+
+        key, _key = jax.random.split(key)
+        aidx = next(agent_idxs)
+        action = jax.random.randint(_key, (), 0, 2 * env.hand_size + env.num_agents)
+        print(f"{action=}")
+        state, reward = env.step_game(state, aidx, 10)
+
+        print(f"Player {aidx} state: -------------------------------------------------")
+        print_state(state, print_shapes_only)
+        print(f"{reward=}")
+
+
+def print_state(state, print_shapes_only):
+    if print_shapes_only:
+        shape_dict = {k: v.shape for k, v in dataclasses.asdict(state).items()}
+        pprint.pprint(shape_dict)
+    else:
+        pprint.pprint(state)
+
+
+if __name__ == "__main__":
+    # Test the Hanabi game environment
+    print_random_rollout()
