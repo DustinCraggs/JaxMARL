@@ -1,20 +1,45 @@
-"LR": 5e-4
-"NUM_ENVS": 1024
-"NUM_STEPS": 128
-"TOTAL_TIMESTEPS": 1e10
-"UPDATE_EPOCHS": 4
-"NUM_MINIBATCHES": 4
-"GAMMA": 0.99
-"GAE_LAMBDA": 0.95
-"CLIP_EPS": 0.2
-"ENT_COEF": 0.01
-"VF_COEF": 0.5
-"MAX_GRAD_NORM": 0.5
-"ENV_NAME": "hanabi"
-"ENV_KWARGS": {}
-"ANNEAL_LR": False
+# Algorithm:
+LR: 5e-4
+# NUM_ENVS: 1024
+NUM_ENVS: 512
+NUM_STEPS: 128
+TOTAL_TIMESTEPS: 2e9
+UPDATE_EPOCHS: 4
+NUM_MINIBATCHES: 4
+GAMMA: 0.99
+GAE_LAMBDA: 0.95
+CLIP_EPS: 0.2
+ENT_COEF: 0.01
+VF_COEF: 0.5
+MAX_GRAD_NORM: 0.5
 
-# WandB Params
-"WANDB_MODE": "disabled"
-"ENTITY": ""
-"PROJECT": ""
+# Model:
+MODEL_KWARGS: {
+  activation: tanh,
+  hidden_size: 64,
+  transf_layers: 2,
+  embed_dim: 32,
+  ff_dim: 64,
+  dropout_prob: 0.0,
+}
+
+# Env:
+ENV_NAME: hanabi
+ENV_KWARGS: {}
+TOKEN_WRAPPER_KWARGS: {
+  add_v0_belief: False,
+  add_original_obs: True,
+}
+ANNEAL_LR: False
+USE_TOKEN_OBS: True
+
+# Other:
+SEED: 0
+GPU_IDX: 0
+
+# WandB:
+WANDB_MODE: disabled
+ENTITY: gyo
+PROJECT: hanabi
+WANDB_RUN_GROUP: null
+WANDB_RUN_NAME: transf_0
