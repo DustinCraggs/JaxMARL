@@ -468,5 +468,6 @@ def print_state(state, print_shapes_only):
 
 
 if __name__ == "__main__":
+    # jax.config.update("jax_disable_jit", True)
     # Test the Hanabi game environment
     print_random_rollout()

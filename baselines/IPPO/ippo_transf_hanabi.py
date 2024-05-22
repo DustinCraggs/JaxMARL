@@ -149,11 +149,11 @@ class ActorCritic(nn.Module):
 class SingleObsTransformerActorCritic(nn.Module):
     action_dim: Sequence[int]
     config: Dict
+    num_obs_sequences: int
     # TODO: Remove defaults:
     num_players: int = 2
     num_colors: int = 5
     hand_size: int = 5
-    num_obs_sequences: int = 4
 
     transf_layers: int = 2
     activation: str = "tanh"
@@ -169,21 +169,24 @@ class SingleObsTransformerActorCritic(nn.Module):
         activation = get_activation(self.activation)
 
         # Different dense encoder for each sequence in obs:
+        # TODO: vmap here?
         obs_embeddings = [
             nn.Dense(self.embed_dim)(obs[i]) for i in range(self.num_obs_sequences)
         ]
         obs_embeddings = jnp.concatenate(obs_embeddings, axis=-2)
-        print(f"{obs_embeddings.shape=}")
+        # TODO: Try activation here:
         # obs_embeddings = activation(obs_embeddings)
 
-        # # Prepend a learnable 'value' and 'no-op' token. These will be used to decode
-        # # the logits for the no-op action and the critic value:
-        # extra_embeddings = nn.Embed(num_embeddings=2, features=self.embed_dim)(
-        #     jnp.array((0, 1), dtype=int)
-        # )
-        # # Repeat the extra tokens to match the batch size:
-        # extra_embeddings = jnp.tile(extra_embeddings, (*obs_embeddings.shape[:2], 1, 1))
-        # obs_embeddings = jnp.concatenate([extra_embeddings, obs_embeddings], axis=-2)
+        # Append a learnable 'no-op' and 'value' token. These will be used to decode
+        # the logits for the no-op action and the critic value:
+        extra_embeddings = nn.Embed(num_embeddings=2, features=self.embed_dim)(
+            jnp.array((0, 1), dtype=int)
+        )
+        # Repeat the extra tokens to match the batch size:
+        extra_embeddings = jnp.tile(
+            extra_embeddings, (*obs_embeddings.shape[:-2], 1, 1)
+        )
+        obs_embeddings = jnp.concatenate([obs_embeddings, extra_embeddings], axis=-2)
 
         for _ in range(self.transf_layers):
             obs_embeddings = EncoderBlock(
@@ -191,44 +194,33 @@ class SingleObsTransformerActorCritic(nn.Module):
                 dim_feedforward=self.ff_dim,
                 dropout_prob=self.dropout_prob,
             )(obs_embeddings)
-        print(f"{obs_embeddings.shape=}")
 
         # Extract the actionable cards:
-        # Embeddings 5-9 are this player's hand, 10+ are partners' hands, last embedding
-        # is no-op
         # TODO: This will be replaced with a mask computed elsewhere:
-        last_actionable_card_idx = (
-            self.num_colors + self.num_players * self.hand_size + 1
-        )
-        print(f"\t\tFrom {self.num_colors=}")
-        print(f"\t\tTo {last_actionable_card_idx=}")
-        # Player hands starts at num_colors + 1 (after fireworks and action tokens):
+        num_hand_cards = self.num_players * self.hand_size
+        # First token is action token, then own hand, next player hand, etc.; last two
+        # tokens are no-op and value:
         action_embeddings = jnp.concatenate(
             (
-                obs_embeddings[..., self.num_colors + 1 : last_actionable_card_idx, :],
-                # obs_embeddings[..., -1:, :],
+                obs_embeddings[..., 1 : num_hand_cards + 1, :],
+                obs_embeddings[..., -2:, :],
             ),
             axis=-2,
         )
 
-        print(f"{action_embeddings.shape=}")
-        # Two actions per card:
-        actor_mean = nn.Dense(2)(action_embeddings)
-        print(f"{actor_mean.shape=}")
-
+        # Two actions per card (remove value token):
+        actor_mean = nn.Dense(2)(action_embeddings[..., :-1, :])
+        # Flatten last two dims into action vector:
         actor_mean = actor_mean.reshape(*actor_mean.shape[:-2], -1)
-        print(f"{actor_mean.shape=}")
-        # TODO: Use no-op token and remove extra element. Temporary: Append 0:
-        actor_mean = jnp.concatenate(
-            (actor_mean, jnp.zeros((*actor_mean.shape[:-1], 1))), axis=-1
-        )
+        # No-op action gets decoded into two values, so remove last action:
+        actor_mean = actor_mean[..., :-1]
 
         unavail_actions = 1 - avail_actions
         action_logits = actor_mean - (unavail_actions * 1e10)
         pi = distrax.Categorical(logits=action_logits)
 
-        # Decode value from the first token (the "value" token):
-        value_embedding = action_embeddings[..., 0, :]
+        # Decode value from the last action embedding (the "value" token):
+        value_embedding = action_embeddings[..., -1, :]
         critic = nn.Dense(512)(value_embedding)
         critic = activation(critic)
         critic = nn.Dense(1)(critic)
@@ -252,7 +244,8 @@ def batchify(x: dict, agent_list, num_actors):
     return x.reshape((num_actors, -1))
 
 
-def batchify_obs(x: dict, agent_list, num_actors, num_sequences):
+def batchify_obs(x: dict, agent_list, num_actors):
+    num_sequences = len(x[agent_list[0]])
     x = [jnp.vstack([x[a][seq] for a in agent_list]) for seq in range(num_sequences)]
     return tuple(
         x[seq].reshape((num_actors, *x[seq].shape[-2:])) for seq in range(num_sequences)
@@ -274,7 +267,7 @@ def make_train(config):
         config["NUM_ACTORS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
 
-    env = HanabiTokenObsWrapper(env)
+    env = HanabiTokenObsWrapper(env, **config["TOKEN_WRAPPER_KWARGS"])
     env = LogWrapper(env)
 
     def linear_schedule(count):
@@ -295,16 +288,19 @@ def make_train(config):
         network = SingleObsTransformerActorCritic(
             env.action_space(env.agents[0]).n,
             config=config,
+            num_obs_sequences=len(obsv[env.agents[0]]),
+            **config["MODEL_KWARGS"],
         )
         # network = ActorCritic(env.action_space(env.agents[0]).n, config=config)
         rng, _rng = jax.random.split(rng)
         # Use env obs to initialize network:
         init_x = (
-            *batchify_obs(obsv, env.agents, config["NUM_ACTORS"], 4),
+            *batchify_obs(obsv, env.agents, config["NUM_ACTORS"]),
             jnp.zeros((1, config["NUM_ACTORS"])),
             jnp.zeros((1, config["NUM_ACTORS"], env.action_space(env.agents[0]).n)),
         )
         network_params = network.init(_rng, init_x)
+
         if config["ANNEAL_LR"]:
             tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
@@ -335,7 +331,7 @@ def make_train(config):
                     batchify(avail_actions, env.agents, config["NUM_ACTORS"])
                 )
 
-                obs_batch = batchify_obs(last_obs, env.agents, config["NUM_ACTORS"], 4)
+                obs_batch = batchify_obs(last_obs, env.agents, config["NUM_ACTORS"])
 
                 # obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
                 ac_in = (
@@ -381,7 +377,7 @@ def make_train(config):
 
             # CALCULATE ADVANTAGE
             train_state, env_state, last_obs, last_done, rng = runner_state
-            last_obs_batch = batchify_obs(last_obs, env.agents, config["NUM_ACTORS"], 4)
+            last_obs_batch = batchify_obs(last_obs, env.agents, config["NUM_ACTORS"])
             avail_actions = jnp.ones(
                 (config["NUM_ACTORS"], env.action_space(env.agents[0]).n)
             )
@@ -427,7 +423,6 @@ def make_train(config):
 
                     def _loss_fn(params, traj_batch, gae, targets):
                         # RERUN NETWORK
-                        print(f"{traj_batch.obs=}")
                         pi, value = network.apply(
                             params,
                             (
@@ -547,20 +542,41 @@ def make_train(config):
     return train
 
 
-@hydra.main(version_base=None, config_path="config", config_name="ippo_ff_hanabi")
-def main(config):
-    config = OmegaConf.to_container(config)
+def init_wandb_run(config, trial_idx=None):
+    group_name = config["WANDB_RUN_GROUP"]
+    run_name = config["WANDB_RUN_NAME"]
 
-    wandb.init(
+    if trial_idx is not None:
+        group_name = f"{group_name}_individual"
+        run_name = f"{run_name}_{trial_idx}"
+
+    return wandb.init(
+        group=group_name,
+        name=run_name,
         entity=config["ENTITY"],
         project=config["PROJECT"],
-        tags=["IPPO", "FF", config["ENV_NAME"]],
+        tags=["PPO", config["ENV_NAME"].upper(), f"jax_{jax.__version__}"],
         config=config,
         mode=config["WANDB_MODE"],
     )
 
-    rng = jax.random.PRNGKey(50)
-    train_jit = jax.jit(make_train(config), device=jax.devices()[0])
+
+@hydra.main(version_base=None, config_path="config", config_name="ippo_ff_hanabi")
+def main(config):
+    config = OmegaConf.to_container(config)
+
+    init_wandb_run(config)
+
+    # TODO: Vectorisation is not working:
+    # rng = jax.random.PRNGKey(config["SEED"])
+    # rngs = jax.random.split(rng, config["NUM_SEEDS"])
+    # device = jax.devices()[config["GPU_IDX"]]
+    # train_vjit = jax.jit(jax.vmap(make_train(config)), device=device)
+    # outs = jax.block_until_ready(train_vjit(rngs))
+
+    rng = jax.random.PRNGKey(config["SEED"])
+    device = jax.devices()[config["GPU_IDX"]]
+    train_jit = jax.jit(make_train(config), device=device)
     out = train_jit(rng)
 
 

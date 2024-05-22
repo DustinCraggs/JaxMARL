@@ -21,12 +21,30 @@ class HanabiTokenObsWrapper(JaxMARLWrapper):
     # - Non-card tokens
     # - Any action transformations
     # - Check if stop gradient necessary here
+    # Things that are missing from this obs in the absence of AOH:
+    # - Teammate hinted info
+    # - Negative hint info
+    # - Discarded cards
 
-    def __init__(self, env: MultiAgentEnv, flatten_obs=False, use_token_actions=True):
+    def __init__(
+        self,
+        env: MultiAgentEnv,
+        use_token_actions=True,
+        add_info_tokens=True,
+        add_life_tokens=True,
+        add_remaining_deck_size=True,
+        add_v0_belief=False,
+        add_original_obs=False,
+        flatten_obs=False,
+    ):
         super().__init__(env)
-
-        self.flatten_obs = flatten_obs
         self.use_token_actions = use_token_actions
+        self.add_info_tokens = add_info_tokens
+        self.add_life_tokens = add_life_tokens
+        self.add_remaining_deck_size = add_remaining_deck_size
+        self.add_v0_belief = add_v0_belief
+        self.add_original_obs = add_original_obs
+        self.flatten_obs = flatten_obs
 
         # TODO: Set obs and action spaces:
         card_enc_length = (self.num_colors + 1) + (self.num_ranks + 2)
@@ -40,7 +58,7 @@ class HanabiTokenObsWrapper(JaxMARLWrapper):
     @partial(jax.jit, static_argnums=[0])
     def reset(self, key: chex.PRNGKey) -> Tuple[Dict[str, Tuple[chex.Array]], State]:
         obs, state = self._env.reset(key)
-        obs = self.state_to_obs(True, None, state, None)
+        obs = self.state_to_obs(True, None, state, None, obs)
         return obs, state
 
     @partial(jax.jit, static_argnums=[0])
@@ -53,6 +71,7 @@ class HanabiTokenObsWrapper(JaxMARLWrapper):
         Dict[str, Tuple[chex.Array]], State, Dict[str, float], Dict[str, bool], Dict
     ]:
         if self.use_token_actions:
+            # state_to_obs method expects env actions, so convert first:
             action = self.process_actions(state, action)
 
         # TODO: how much performance improvement would there be if we skip creation
@@ -60,17 +79,15 @@ class HanabiTokenObsWrapper(JaxMARLWrapper):
         old_state = state
         obs, new_state, reward, done, info = self._env.step(key, old_state, action)
 
-        obs = self.state_to_obs(False, old_state, new_state, action)
+        obs = self.state_to_obs(False, old_state, new_state, action, obs)
         return obs, new_state, reward, done, info
 
     @partial(jax.jit, static_argnums=[0])
     def process_actions(self, state, actions):
-        print(f"BEFORE {actions=}")
         actions = {
             name: self.action_to_env_action(state, aidx, actions[name])
             for aidx, name in enumerate(self.agents)
         }
-        print(f"AFTER {actions=}")
         return actions
 
     @partial(jax.jit, static_argnums=[0])
@@ -111,17 +128,6 @@ class HanabiTokenObsWrapper(JaxMARLWrapper):
             # Shift up by num_ranks for colour hints:
             hint_value = hint_one_hot.argmax() + (self.num_colors * is_rank_hint)
 
-            # Print all values:
-            print(f"{hint_action=}")
-            print(f"{teammate_idx=}")
-            print(f"{card_idx=}")
-            print(f"{is_rank_hint=}")
-            print(f"{hint_card=}")
-            print(f"{hint_card_rank=}")
-            print(f"{hint_card_colour=}")
-            print(f"{hint_one_hot=}")
-            print(f"{hint_value=}")
-
             hints_per_player = self.num_colors + self.num_ranks
             # First hand_size * 2 actions are discards and plays.
             return self.hand_size * 2 + hints_per_player * teammate_idx + hint_value
@@ -140,6 +146,7 @@ class HanabiTokenObsWrapper(JaxMARLWrapper):
         old_state: State,
         new_state: State,
         actions: Dict[str, chex.Array],
+        obs: chex.Array,
     ) -> chex.Array:
         """
         Each card encoding has color, rank, player hand, position in hand, and type.
@@ -154,51 +161,65 @@ class HanabiTokenObsWrapper(JaxMARLWrapper):
         - Type: {observation, action_play, action_discard, action_hint_self,
           action_hint_teammate_1, action_hint_teammate_2, ...}
         """
-        fireworks_tokens = {
-            aidx: self.get_fireworks_tokens(new_state)
-            for aidx in range(self.num_agents)
-        }
+        fireworks_tokens = self.get_fireworks_tokens(new_state)
+
         hand_tokens = {
             aidx: self.get_hand_tokens(new_state, aidx)
             for aidx in range(self.num_agents)
         }
 
+        action_tokens = self.get_aidx_to_action_tokens(
+            is_first_state, old_state, actions
+        )
+
         card_tokens = {
-            aidx: jnp.concatenate((fireworks_tokens[aidx], hand_tokens[aidx]))
+            aidx: jnp.concatenate(
+                (action_tokens[aidx], hand_tokens[aidx], fireworks_tokens)
+            )
             for aidx in range(self.num_agents)
         }
 
-        if not is_first_state:
-            # Convert one-hot player index to scalar:
-            last_cur_player = old_state.cur_player_idx.argmax()
-            # Extract the action of the last current agent (the one that actually acted):
-            actions = jnp.array([actions[i] for i in self._env.agents])
-            action = actions[last_cur_player]
-            action_tokens = {
-                aidx: self.get_action_token(old_state, action, last_cur_player, aidx)
-                for aidx in range(self.num_agents)
-            }
-        else:
-            action_tokens = {
-                aidx: jnp.zeros((self.token_length,)) for aidx in range(self.num_agents)
-            }
-
-        card_tokens = {
-            aidx: jnp.vstack((action_tokens[aidx], card_tokens[aidx]))
-            for aidx in range(self.num_agents)
-        }
-
+        # Add extra tokens:
         extra_tokens = self.get_extra_tokens(new_state)
         name_to_tokens = {
-            name: (card_tokens[aidx], *extra_tokens)
+            name: (
+                card_tokens[aidx],
+                *self.get_extra_tokens_for_agent(new_state, aidx),
+                *extra_tokens,
+            )
             for aidx, name in enumerate(self.agents)
         }
+
+        if self.add_original_obs:
+            name_to_tokens = {
+                name: (*name_to_tokens[name], jnp.expand_dims(obs[name], 0))
+                for name in self.agents
+            }
+
         if self.flatten_obs:
             name_to_tokens = {
                 name: jnp.concatenate([t.ravel() for t in tokens])
                 for name, tokens in name_to_tokens.items()
             }
         return name_to_tokens
+
+    @partial(jax.jit, static_argnums=[0, 1])
+    def get_aidx_to_action_tokens(self, is_first_state, old_state, actions):
+        if is_first_state:
+            # Add a null action for the first observation (means obs are always
+            # the same size, but ultimately this should ideally be masked):
+            null_action = jnp.zeros((1, self.token_length))
+            return {aidx: null_action for aidx in range(self.num_agents)}
+        # Convert one-hot player index to scalar:
+        last_cur_player = old_state.cur_player_idx.argmax()
+        # Extract the action of the last current agent (the one that actually acted):
+        actions = jnp.array([actions[a] for a in self.agents])
+        action = actions[last_cur_player]
+        action_tokens = {
+            aidx: self.get_action_token(old_state, action, last_cur_player, aidx)
+            for aidx in range(self.num_agents)
+        }
+        return {aidx: jnp.expand_dims(tok, 0) for aidx, tok in action_tokens.items()}
 
     @partial(jax.jit, static_argnums=[0])
     def get_action_token(
@@ -242,7 +263,7 @@ class HanabiTokenObsWrapper(JaxMARLWrapper):
         # Append 0 (the extra value indicating fireworks):
         relative_player_idx = jnp.concatenate((relative_player_idx, jnp.zeros(1)))
 
-        # The "position" of hints is the max value of the hand size + 1:
+        # The "position" of hints is the max value of hand_size + 1:
         position = lax.select(is_hint, self.hand_size + 1, action % self.hand_size)
         position = nn.one_hot(position, num_classes=self.hand_size + 2)
 
@@ -264,10 +285,11 @@ class HanabiTokenObsWrapper(JaxMARLWrapper):
             return jnp.concatenate((jnp.zeros(3), target_onehot))
 
         def get_play_discard_action_type():
-            is_play = action < self.hand_size
-            # 0 is "observation", 1 is "play", 2 is "discard":
-            value = lax.select(is_play, 1, 2)
-            return nn.one_hot(value, num_classes=self.num_agents + 3)
+            is_discard = action < self.hand_size
+            # value = lax.select(is_discard, 1, 2)
+            # 0 is "observation", 1 is "play", 2 is "discard". num_agents possible hint
+            # targets, plus observation, discard, and play:
+            return nn.one_hot(1 + is_discard, num_classes=self.num_agents + 3)
 
         action_type = lax.cond(
             is_hint,
@@ -286,17 +308,17 @@ class HanabiTokenObsWrapper(JaxMARLWrapper):
 
     @partial(jax.jit, static_argnums=[0])
     def get_fireworks_tokens(self, new_state: State):
+        # One extra row for unknown:
+        colors = jnp.eye(self.num_colors, self.num_colors + 1)
+
         # Convert firework ranks to 1-hot encoding:
         ranks = new_state.fireworks.sum(axis=1)
-        # Extra row for full fireworks (rank 5) and unknown. The card here corresponds
+        # Extra col for full fireworks (rank 5) and unknown. The card here corresponds
         # to the rank of the next card that can be played on the fireworks (as suggested
         # by Ravi):
         ranks = nn.one_hot(ranks, num_classes=self.num_ranks + 2)
 
-        # One extra row for unknown:
-        colors = jnp.eye(self.num_colors, self.num_colors + 1)
-
-        # Special value for fireworks:
+        # Special values for fireworks:
         player = nn.one_hot(self.num_agents, num_classes=self.num_agents + 1)
         position = nn.one_hot(self.hand_size, num_classes=self.hand_size + 2)
         token_type = nn.one_hot(0, num_classes=self.num_agents + 3)
@@ -328,16 +350,7 @@ class HanabiTokenObsWrapper(JaxMARLWrapper):
         extra_encodings = jnp.vstack(
             (1 - color_revealed, jnp.zeros_like(rank_revealed), 1 - rank_revealed)
         )
-        # Extra encodings for other hands:
-        # num_teammate_cards = self.hand_size * (self.num_agents - 1)
-        # extra_encodings = jnp.concatenate(
-        #     (extra_encodings, jnp.zeros((3, num_teammate_cards)))
-        # )
-        print(f"{color_revealed=}")
-        print(f"{rank_revealed=}")
-        print(f"{extra_encodings.T=}")
-        print(f"{hands_one_hot=}")
-        # hands_one_hot = self.add_extra_card_encodings(hands_one_hot, extra_encodings.T)
+        # Add extra encodings for own hand, and zeros for teammates' hands:
         hands_one_hot = jnp.concatenate(
             (
                 # Own cards:
@@ -346,8 +359,6 @@ class HanabiTokenObsWrapper(JaxMARLWrapper):
                 self.add_extra_card_encodings(hands_one_hot[1:]),
             )
         )
-        print(f"{hands_one_hot=}")
-        input()
 
         # Stack all cards as rows:
         hands_one_hot = jnp.vstack(hands_one_hot)
@@ -381,17 +392,35 @@ class HanabiTokenObsWrapper(JaxMARLWrapper):
         - Lives remaining
         - Cards left in deck
         """
-        # Thermometer encodings:
-        info_tokens = new_state.info_tokens
-        life_tokens = new_state.life_tokens
-        remaining_deck_size = new_state.remaining_deck_size
-        # Convert thermometer to one hot:
-        extra_tokens = (
-            nn.one_hot(info_tokens.sum(), num_classes=info_tokens.size),
-            nn.one_hot(life_tokens.sum(), num_classes=life_tokens.size),
-            nn.one_hot(remaining_deck_size.sum(), num_classes=remaining_deck_size.size),
-        )
+        extra_tokens = []
 
+        # Thermometer encodings:
+        if self.add_info_tokens:
+            info_tokens = new_state.info_tokens
+            extra_tokens.append(
+                nn.one_hot(info_tokens.sum(), num_classes=info_tokens.size + 1)
+            )
+        if self.add_life_tokens:
+            life_tokens = new_state.life_tokens
+            extra_tokens.append(
+                nn.one_hot(life_tokens.sum(), num_classes=life_tokens.size + 1)
+            )
+        if self.add_remaining_deck_size:
+            remaining_deck_size = new_state.remaining_deck_size
+            num_remaining = remaining_deck_size.sum()
+            extra_tokens.append(
+                nn.one_hot(num_remaining, num_classes=remaining_deck_size.size + 1)
+            )
+        if self.add_v0_belief:
+            belief_v0 = self.get_v0_belief_own_hand_tokens(new_state, 0)
+        return tuple(jnp.expand_dims(token, 0) for token in extra_tokens)
+
+    @partial(jax.jit, static_argnums=[0])
+    def get_extra_tokens_for_agent(self, new_state: State, aidx: int):
+        extra_tokens = []
+        if self.add_v0_belief:
+            belief_v0 = self.get_v0_belief_own_hand_tokens(new_state, aidx).ravel()
+            extra_tokens.append(belief_v0)
         return tuple(jnp.expand_dims(token, 0) for token in extra_tokens)
 
     @partial(jax.jit, static_argnums=[0])
@@ -406,20 +435,92 @@ class HanabiTokenObsWrapper(JaxMARLWrapper):
     @partial(jax.jit, static_argnums=[0])
     def card_matrix_to_encoding(self, card_matrix: chex.Array) -> chex.Array:
         """
-        card_matrix is the representation used in player_hands a "one-hot matrix" of
-        shape (num_ranks, num_colors).
+        card_matrix is the representation used in player_hands, a one-hot matrix of
+        shape (..., num_colors, num_ranks).
         """
         color = card_matrix.sum(axis=-1)
         rank = card_matrix.sum(axis=-2)
-        return jnp.concatenate((rank, color), axis=-1)
+        # return jnp.concatenate((rank, color), axis=-1)
+        return jnp.concatenate((color, rank), axis=-1)
 
     @partial(jax.jit, static_argnums=[0])
     def add_extra_card_encodings(self, card_one_hot, values=0):
         # Add the extra elements for "unknown" colors and ranks, and the extra rank for
         # max fireworks:
         last_idx = self.num_colors + self.num_ranks
+
+        # SWAP COLOURS AND RANKS and check for assumptions elsewhere
         extra_idxs = jnp.array([self.num_colors, last_idx, last_idx])
         return jnp.insert(card_one_hot, extra_idxs, values, axis=-1)
+
+    @partial(jax.jit, static_argnums=[0])
+    def get_v0_belief_own_hand_tokens(self, state: State, aidx: int):
+        """
+        Adapted from hanabi.py get_v0_belief_feats.
+        TODO: Why does the count not incorporate knowledge of cards in other players'
+        hands?
+        """
+        full_deck = self.get_full_deck()
+        remaining_card_counts = (
+            full_deck.sum(axis=0).ravel()
+            - state.discard_pile.sum(axis=0).ravel()
+            - state.fireworks.ravel()
+        )
+        # Remove counts for cards that have been precluded by hint info:
+        belief_v0 = state.card_knowledge[aidx] * remaining_card_counts
+        # Normalize:
+        belief_v0 /= belief_v0.sum(axis=1)[:, jnp.newaxis]
+        return belief_v0.reshape((self.hand_size, self.num_colors, self.num_ranks))
+
+    def render_token_obs(self, obs):
+        lines = []
+        for agent, agent_obs in obs.items():
+            lines.append(f"Obs for {agent}")
+            lines.append("\tHand:")
+            # Add card representations:
+            lines.extend(f"\t\t{self.render_card_token(card)}" for card in agent_obs[0])
+
+            agent_obs_idx = 1
+            if self.add_info_tokens:
+                lines.append(f"\tInfo tokens: {agent_obs[agent_obs_idx][0]}")
+                agent_obs_idx += 1
+            if self.add_life_tokens:
+                lines.append(f"\tLife tokens: {agent_obs[agent_obs_idx][0]}")
+                agent_obs_idx += 1
+            if self.add_remaining_deck_size:
+                one_line_str = "".join(str(agent_obs[agent_obs_idx][0]).split("\n"))
+                lines.append(f"\tRemaining deck size: {one_line_str}")
+                agent_obs_idx += 1
+        return "\n".join(lines)
+
+    def render_card_token(self, card_token_obs):
+        card_schema = [
+            ("Color", self.num_colors, " "),
+            ("(Unknown?", 1, ") "),
+            ("Rank", self.num_ranks, " "),
+            ("(Max Firework?", 1, ", "),
+            ("Unknown?", 1, ") "),
+            ("Player", self.num_agents, " "),
+            ("(Firework?", 1, ") "),
+            ("Position", self.hand_size, " "),
+            ("(Firework?", 1, ", "),
+            ("Hint?", 1, ") "),
+            ("Type", self.num_agents + 3, ""),
+        ]
+
+        expected_length = sum(length for _, length, _ in card_schema)
+        if len(card_token_obs) != expected_length:
+            raise ValueError(
+                f"Expected {expected_length} values in card token, got "
+                f"{len(card_token_obs)} for card token {card_token_obs}"
+            )
+
+        strings = []
+        for name, length, suffix in card_schema:
+            strings.append(f"{name}: {card_token_obs[:length]}{suffix}")
+            card_token_obs = card_token_obs[length:]
+
+        return "".join(strings)
 
 
 def random_wrapped_rollout(print_shapes_only=False, step_through=True, **env_kwargs):
@@ -430,16 +531,7 @@ def random_wrapped_rollout(print_shapes_only=False, step_through=True, **env_kwa
 
     key = jax.random.PRNGKey(0)
     obs, state = env.reset(key)
-    dones = {a: False for a in env.agents}
-
-    print(f"{state=}")
-    print(f"{obs=}")
-    for action in range(2 * env.hand_size + env.num_colors + env.num_ranks):
-        a1 = env.action_to_env_action(state, 0, action)
-        a2 = env.action_to_env_action(state, 1, action)
-        print(f"{obs['agent_0'][0][env.num_colors + 1 + action // 2]=}")
-        print(f"{obs['agent_1'][0][env.num_colors + 1 + action // 2]=}")
-        print(f"{action=} {a1=} {a2=}")
+    print(env.render_token_obs(obs))
 
     while True:
         if step_through:
@@ -454,11 +546,12 @@ def random_wrapped_rollout(print_shapes_only=False, step_through=True, **env_kwa
             2 * env.hand_size + num_hints * (env.num_agents - 1),
         )
         actions = {a: action for a, action in zip(env.agents, actions)}
-        # pprint(actions)
+        pprint(actions)
         key, _key = jax.random.split(key)
-        pprint(state)
+        # pprint(state)
         obs, state, rewards, dones, infos = env.step(_key, state, actions)
-        # pprint(obs)
+        env.get_v0_belief_own_hand_tokens(state, 0)
+        print(env.render_token_obs(obs))
 
 
 if __name__ == "__main__":
