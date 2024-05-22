@@ -1,6 +1,7 @@
 """
 JaxMarl Hanabi Environment
 """
+
 import itertools
 import numpy as np
 import jax
@@ -65,15 +66,15 @@ class HanabiEnv(HanabiGame):
         self.action_encoding = {}
         for i, a in enumerate(self.action_set):
             if a < hand_size:
-                move_type = f'D{i%hand_size}'
-            elif a < hand_size*2:
-                move_type = f'P{i%hand_size}'
-            elif a < hand_size*2 + num_colors:
-                move_type = f'H{self.color_map[i - hand_size*2]}' 
-            elif a < hand_size*2 + (num_colors + num_ranks):
-                move_type = f'H{i - (hand_size*2+num_colors)+1}' 
+                move_type = f"D{i%hand_size}"
+            elif a < hand_size * 2:
+                move_type = f"P{i%hand_size}"
+            elif a < hand_size * 2 + num_colors:
+                move_type = f"H{self.color_map[i - hand_size*2]}"
+            elif a < hand_size * 2 + (num_colors + num_ranks):
+                move_type = f"H{i - (hand_size*2+num_colors)+1}"
             else:
-                move_type = 'N'
+                move_type = "N"
             self.action_encoding[int(a)] = move_type
 
         # useful ranges to know the type of the action
@@ -138,9 +139,11 @@ class HanabiEnv(HanabiGame):
         state = self.reset_game(key)
         obs = self.get_obs(state, state, action=20)
         return obs, state
-    
+
     @partial(jax.jit, static_argnums=[0])
-    def reset_from_deck(self, key: chex.PRNGKey, deck:chex.Array) -> Tuple[Dict, State]:
+    def reset_from_deck(
+        self, key: chex.PRNGKey, deck: chex.Array
+    ) -> Tuple[Dict, State]:
         """Inject a deck in the game. Useful for testing."""
         state = self.reset_game_from_deck(key, deck)
         obs = self.get_obs(state, state, action=20)
@@ -423,28 +426,29 @@ class HanabiEnv(HanabiGame):
         }
 
         return feats
-    
+
     @partial(jax.jit, static_argnums=[0])
     def get_last_action_feats(
         self, aidx: int, old_state: State, new_state: State, action: chex.Array
     ):
         """Get the features of the last action taken"""
         last_action = self.get_last_action_feats_(aidx, old_state, new_state, action)
-        last_action = jnp.concatenate((
-            last_action['acting_player_relative_index'],
-            last_action['move_type'],
-            last_action['target_player_relative_index'],
-            last_action['color_revealed'],
-            last_action['rank_revealed'],
-            last_action['reveal_outcome'],
-            last_action['pos_played_discarded'],
-            last_action['played_discarded_card'],
-            last_action['card_played_score'],
-            last_action['added_info_tokens'],
-        ))
+        last_action = jnp.concatenate(
+            (
+                last_action["acting_player_relative_index"],
+                last_action["move_type"],
+                last_action["target_player_relative_index"],
+                last_action["color_revealed"],
+                last_action["rank_revealed"],
+                last_action["reveal_outcome"],
+                last_action["pos_played_discarded"],
+                last_action["played_discarded_card"],
+                last_action["card_played_score"],
+                last_action["added_info_tokens"],
+            )
+        )
 
         return last_action
-
 
     @partial(jax.jit, static_argnums=[0])
     def get_board_feats(self, state: State):
@@ -471,6 +475,7 @@ class HanabiEnv(HanabiGame):
     @partial(jax.jit, static_argnums=[0])
     def get_full_deck(self):
         """Get the full deck of cards."""
+
         def _gen_cards(aidx):
             """Generates one-hot card encodings given (color, rank) pairs"""
             color, rank = color_rank_pairs[aidx]
@@ -581,7 +586,7 @@ class HanabiEnv(HanabiGame):
                     f"agent {i} representation of the belief of its {z}th-relative agent:",
                     b,
                 )
-    
+
     def card_to_string(self, card: chex.Array) -> str:
         # transforms a card matrix to string
         if ~card.any():  # empyt card
@@ -652,8 +657,12 @@ class HanabiEnv(HanabiGame):
             "information": int(state.info_tokens.sum()),
             "lives": int(state.life_tokens.sum()),
             "deck": int(state.deck.sum()),
-            "discards": " ".join(self.card_to_string(card) for card in state.discard_pile),
-            "fireworks": " ".join(self.card_to_string(card) for card in fireworks_cards),
+            "discards": " ".join(
+                self.card_to_string(card) for card in state.discard_pile
+            ),
+            "fireworks": " ".join(
+                self.card_to_string(card) for card in fireworks_cards
+            ),
         }
 
         for i, (k, v) in enumerate(board_info.items()):
@@ -670,12 +679,16 @@ class HanabiEnv(HanabiGame):
             for card_str in get_actor_hand_str(aidx):
                 print(card_str)
 
-    def get_obs_str(self, new_state, old_state=None, action=20, include_belief=False, best_belief=5):
+    def get_obs_str(
+        self, new_state, old_state=None, action=20, include_belief=False, best_belief=5
+    ):
         """Get the observation as a string."""
-        
+
         output = ""
 
-        def get_actor_hand_str(aidx: int, belief: chex.Array=None, mask_hand=False) -> str:
+        def get_actor_hand_str(
+            aidx: int, belief: chex.Array = None, mask_hand=False
+        ) -> str:
             # get the index of an actor and returns its hand (with knowledge per card) as string
             # TODO: missing the first numbers, don't know what they are
 
@@ -716,7 +729,8 @@ class HanabiEnv(HanabiGame):
                         f"{color}{rank+1}: {card_belief[i]:.3f}"
                         for i, (color, rank) in enumerate(
                             itertools.product(self.color_map, range(self.num_ranks))
-                        ) if i in best_belief_idx
+                        )
+                        if i in best_belief_idx
                     )
                     card_knowledge_str += f", Belief: [{card_belief}]"
 
@@ -747,8 +761,12 @@ class HanabiEnv(HanabiGame):
             "information available": int(new_state.info_tokens.sum()),
             "lives available": int(new_state.life_tokens.sum()),
             "deck remaining cards": int(new_state.deck.sum()),
-            "discards": " ".join(self.card_to_string(card) for card in new_state.discard_pile),
-            "fireworks": " ".join(self.card_to_string(card) for card in fireworks_cards),
+            "discards": " ".join(
+                self.card_to_string(card) for card in new_state.discard_pile
+            ),
+            "fireworks": " ".join(
+                self.card_to_string(card) for card in fireworks_cards
+            ),
         }
 
         for i, (k, v) in enumerate(board_info.items()):
@@ -766,28 +784,35 @@ class HanabiEnv(HanabiGame):
         for aidx in range(self.num_agents):
             output += ("Your Hand:" if aidx == current_player else "Other Hand:") + "\n"
             for card_str in get_actor_hand_str(
-                aidx, mask_hand=aidx == current_player, belief=belief[aidx] if include_belief else None
+                aidx,
+                mask_hand=aidx == current_player,
+                belief=belief[aidx] if include_belief else None,
             ):
                 output += card_str + "\n"
-
 
         # last action feature
         if old_state is None:
             old_state = new_state
-        last_action_feats = self.get_last_action_feats_(current_player, old_state, new_state, action)
+        last_action_feats = self.get_last_action_feats_(
+            current_player, old_state, new_state, action
+        )
 
         move_type = self.action_encoding[int(action)]
         output += f"Last action: {move_type}\n"
 
-        if move_type[0] == 'H': # hint move
-            reveal_outcome = np.where(last_action_feats['reveal_outcome'])[0]
+        if move_type[0] == "H":  # hint move
+            reveal_outcome = np.where(last_action_feats["reveal_outcome"])[0]
             output += f"Cards afected: {reveal_outcome}\n"
-        elif move_type[0] in ['D','P']:
-            card_played = self.card_to_string(last_action_feats['played_discarded_card'].reshape(self.num_colors, self.num_ranks))
+        elif move_type[0] in ["D", "P"]:
+            card_played = self.card_to_string(
+                last_action_feats["played_discarded_card"].reshape(
+                    self.num_colors, self.num_ranks
+                )
+            )
             output += f"Card Played: {card_played}\n"
-        if move_type[0] == 'P':
-            card_scored = last_action_feats['card_played_score'][0]
-            card_added_info = last_action_feats['added_info_tokens'][0]
+        if move_type[0] == "P":
+            card_scored = last_action_feats["card_played_score"][0]
+            card_added_info = last_action_feats["added_info_tokens"][0]
             output += f"Scored: {card_scored}\n"
             output += f"Added Info: {card_added_info}\n"
 
