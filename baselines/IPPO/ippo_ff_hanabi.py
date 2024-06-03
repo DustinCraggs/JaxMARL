@@ -113,8 +113,8 @@ def make_train(config):
         init_x = (
             jnp.zeros(
                 # TODO: Temporary change:
-                # (1, config["NUM_ENVS"], obsv[env.agents[0]].shape[-1])
-                (1, config["NUM_ENVS"], env.observation_space(env.agents[0]).n)
+                (1, config["NUM_ENVS"], obsv[env.agents[0]].shape[-1])
+                # (1, config["NUM_ENVS"], env.observation_space(env.agents[0]).n)
             ),
             jnp.zeros((1, config["NUM_ENVS"])),
             jnp.zeros((1, config["NUM_ENVS"], env.action_space(env.agents[0]).n)),

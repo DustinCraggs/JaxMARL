@@ -167,13 +167,13 @@ class SingleObsTransformerActorCritic(nn.Module):
     def __call__(self, x):
         *obs, dones, avail_actions = x
         activation = get_activation(self.activation)
-
+        print(f"{obs=}")
         # Different dense encoder for each sequence in obs:
-        # TODO: vmap here?
         obs_embeddings = [
             nn.Dense(self.embed_dim)(obs[i]) for i in range(self.num_obs_sequences)
         ]
         obs_embeddings = jnp.concatenate(obs_embeddings, axis=-2)
+        print(f"{obs_embeddings=}")
         # TODO: Try activation here:
         # obs_embeddings = activation(obs_embeddings)
 
@@ -186,7 +186,9 @@ class SingleObsTransformerActorCritic(nn.Module):
         extra_embeddings = jnp.tile(
             extra_embeddings, (*obs_embeddings.shape[:-2], 1, 1)
         )
+        print(f"{extra_embeddings=}")
         obs_embeddings = jnp.concatenate([obs_embeddings, extra_embeddings], axis=-2)
+        print(f"{obs_embeddings=}")
 
         for _ in range(self.transf_layers):
             obs_embeddings = EncoderBlock(
@@ -198,15 +200,28 @@ class SingleObsTransformerActorCritic(nn.Module):
         # Extract the actionable cards:
         # TODO: This will be replaced with a mask computed elsewhere:
         num_hand_cards = self.num_players * self.hand_size
+        # There are num_obs_sequences extra elements, because currently all
+        # extra sequences only have one element (minus two for value and no-op).
+        # There are num_colors fireworks tokens, and two extra tokens at the end of the
+        # sequence. Before that are the hand cards:
+        num_trailing = self.num_obs_sequences - 1 + self.num_colors + 2
+
+        # Only keep encodings for the newest observation:
+        obs_embeddings = obs_embeddings[..., -1, :, :]
+        print(f"{obs_embeddings=}")
+
         # First token is action token, then own hand, next player hand, etc.; last two
         # tokens are no-op and value:
         action_embeddings = jnp.concatenate(
             (
-                obs_embeddings[..., 1 : num_hand_cards + 1, :],
+                # obs_embeddings[..., 1 : num_hand_cards + 1, :],
+                # TODO: This is a temporary hack to get the card indices from the end:
+                obs_embeddings[..., -num_trailing - num_hand_cards : -num_trailing, :],
                 obs_embeddings[..., -2:, :],
             ),
             axis=-2,
         )
+        print(f"{action_embeddings=}")
 
         # Two actions per card (remove value token):
         actor_mean = nn.Dense(2)(action_embeddings[..., :-1, :])
@@ -244,11 +259,14 @@ def batchify(x: dict, agent_list, num_actors):
     return x.reshape((num_actors, -1))
 
 
-def batchify_obs(x: dict, agent_list, num_actors):
+def batchify_obs(x: dict, agent_list, num_actors, sequence_length):
+    # TODO: Improve:
     num_sequences = len(x[agent_list[0]])
     x = [jnp.vstack([x[a][seq] for a in agent_list]) for seq in range(num_sequences)]
     return tuple(
-        x[seq].reshape((num_actors, *x[seq].shape[-2:])) for seq in range(num_sequences)
+        # TODO: *x[seq].shape[-2:] if not using sequences:
+        x[seq].reshape((num_actors, *x[seq].shape[-3:]))
+        for seq in range(num_sequences)
     )
 
 
@@ -293,9 +311,15 @@ def make_train(config):
         )
         # network = ActorCritic(env.action_space(env.agents[0]).n, config=config)
         rng, _rng = jax.random.split(rng)
+
+        # Add sequence dimension to obsv:
+        obsv = jax.tree_map(lambda x: x[:, np.newaxis, :], obsv)
+
         # Use env obs to initialize network:
         init_x = (
-            *batchify_obs(obsv, env.agents, config["NUM_ACTORS"]),
+            *batchify_obs(
+                obsv, env.agents, config["NUM_ACTORS"], config["SEQUENCE_LENGTH"]
+            ),
             jnp.zeros((1, config["NUM_ACTORS"])),
             jnp.zeros((1, config["NUM_ACTORS"], env.action_space(env.agents[0]).n)),
         )
@@ -331,7 +355,12 @@ def make_train(config):
                     batchify(avail_actions, env.agents, config["NUM_ACTORS"])
                 )
 
-                obs_batch = batchify_obs(last_obs, env.agents, config["NUM_ACTORS"])
+                obs_batch = batchify_obs(
+                    last_obs,
+                    env.agents,
+                    config["NUM_ACTORS"],
+                    config["SEQUENCE_LENGTH"],
+                )
 
                 # obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
                 ac_in = (
@@ -356,6 +385,17 @@ def make_train(config):
                 obsv, env_state, reward, done, info = jax.vmap(
                     env.step, in_axes=(0, 0, 0)
                 )(rng_step, env_state, env_act)
+
+                # Shift last_obs back by one along sequence dim and insert new obs at
+                # end:
+                obsv = jax.tree_map(
+                    lambda x, y: jnp.concatenate(
+                        (x[:, 1:, ...], y[:, np.newaxis, ...]), axis=1
+                    ),
+                    last_obs,
+                    obsv,
+                )
+
                 info = jax.tree_map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
                 done_batch = batchify(done, env.agents, config["NUM_ACTORS"]).squeeze()
                 transition = Transition(
@@ -377,7 +417,9 @@ def make_train(config):
 
             # CALCULATE ADVANTAGE
             train_state, env_state, last_obs, last_done, rng = runner_state
-            last_obs_batch = batchify_obs(last_obs, env.agents, config["NUM_ACTORS"])
+            last_obs_batch = batchify_obs(
+                last_obs, env.agents, config["NUM_ACTORS"], config["SEQUENCE_LENGTH"]
+            )
             avail_actions = jnp.ones(
                 (config["NUM_ACTORS"], env.action_space(env.agents[0]).n)
             )
@@ -525,6 +567,23 @@ def make_train(config):
             update_steps = update_steps + 1
             runner_state = (train_state, env_state, last_obs, last_done, rng)
             return (runner_state, update_steps), None
+
+        # Add a sequence dimension to obsv:
+        print(f"\t1: {obsv=}")
+        # Left pad the sequence dimension with zeros to sequence length:
+        obsv = jax.tree_map(
+            lambda x: jnp.concatenate(
+                (
+                    jnp.zeros(
+                        (*x.shape[:1], config["SEQUENCE_LENGTH"] - 1, *x.shape[2:])
+                    ),
+                    x,
+                ),
+                axis=1,
+            ),
+            obsv,
+        )
+        print(f"\t3: {obsv=}")
 
         rng, _rng = jax.random.split(rng)
         runner_state = (
