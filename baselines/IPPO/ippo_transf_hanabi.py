@@ -23,6 +23,7 @@ from jaxmarl.wrappers.baselines import LogWrapper
 from jaxmarl.wrappers.hanabi_token_obs import HanabiTokenObsWrapper
 
 # TODO:
+# - Temporal encodings
 # - Are the batchify and unbatchify functions jitted?
 
 
@@ -146,7 +147,8 @@ class ActorCritic(nn.Module):
         return pi, jnp.squeeze(critic, axis=-1)
 
 
-class SingleObsTransformerActorCritic(nn.Module):
+@nn.checkpoint
+class TransformerActorCritic(nn.Module):
     action_dim: Sequence[int]
     config: Dict
     num_obs_sequences: int
@@ -154,6 +156,7 @@ class SingleObsTransformerActorCritic(nn.Module):
     num_players: int = 2
     num_colors: int = 5
     hand_size: int = 5
+    max_seq_len: int = 15
 
     transf_layers: int = 2
     activation: str = "tanh"
@@ -167,15 +170,43 @@ class SingleObsTransformerActorCritic(nn.Module):
     def __call__(self, x):
         *obs, dones, avail_actions = x
         activation = get_activation(self.activation)
+
         print(f"{obs=}")
+
         # Different dense encoder for each sequence in obs:
         obs_embeddings = [
             nn.Dense(self.embed_dim)(obs[i]) for i in range(self.num_obs_sequences)
         ]
         obs_embeddings = jnp.concatenate(obs_embeddings, axis=-2)
-        print(f"{obs_embeddings=}")
+
+        print(f"1: {obs_embeddings=}")
+
         # TODO: Try activation here:
         # obs_embeddings = activation(obs_embeddings)
+
+        # Add temporal embeddings:
+        temporal_embedding_table = nn.Embed(
+            num_embeddings=self.max_seq_len,
+            features=self.embed_dim,
+        )
+        seq_len = obs_embeddings.shape[-3]
+        temporal_embeddings = temporal_embedding_table(
+            jnp.arange(self.max_seq_len - seq_len, self.max_seq_len)
+        )
+        print(f"{temporal_embeddings=}")
+        obs_embeddings = (
+            obs_embeddings + temporal_embeddings[np.newaxis, :, np.newaxis, :]
+        )
+        print(f"2: {obs_embeddings=}")
+
+        # [batch_size, seq_len, tokens, embed_dim]
+        # [1, 1, seq_len]
+
+        # Flatten the sequence and token dimensions:
+        obs_embeddings = obs_embeddings.reshape(
+            (*obs_embeddings.shape[:-3], -1, self.embed_dim)
+        )
+        print(f"3: {obs_embeddings=}")
 
         # Append a learnable 'no-op' and 'value' token. These will be used to decode
         # the logits for the no-op action and the critic value:
@@ -188,7 +219,7 @@ class SingleObsTransformerActorCritic(nn.Module):
         )
         print(f"{extra_embeddings=}")
         obs_embeddings = jnp.concatenate([obs_embeddings, extra_embeddings], axis=-2)
-        print(f"{obs_embeddings=}")
+        print(f"4: {obs_embeddings=}")
 
         for _ in range(self.transf_layers):
             obs_embeddings = EncoderBlock(
@@ -205,10 +236,6 @@ class SingleObsTransformerActorCritic(nn.Module):
         # There are num_colors fireworks tokens, and two extra tokens at the end of the
         # sequence. Before that are the hand cards:
         num_trailing = self.num_obs_sequences - 1 + self.num_colors + 2
-
-        # Only keep encodings for the newest observation:
-        obs_embeddings = obs_embeddings[..., -1, :, :]
-        print(f"{obs_embeddings=}")
 
         # First token is action token, then own hand, next player hand, etc.; last two
         # tokens are no-op and value:
@@ -303,7 +330,7 @@ def make_train(config):
         obsv, env_state = jax.vmap(env.reset, in_axes=(0))(reset_rng)
 
         # INIT NETWORK
-        network = SingleObsTransformerActorCritic(
+        network = TransformerActorCritic(
             env.action_space(env.agents[0]).n,
             config=config,
             num_obs_sequences=len(obsv[env.agents[0]]),
